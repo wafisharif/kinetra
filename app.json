@@ -1,15 +1,16 @@
 {
   "expo": {
-    "name": "biomech-app",
-    "slug": "biomech-app",
-    "version": "1.0.0",
+    "name": "Kinetra",
+    "slug": "kinetra",
+    "version": "0.1.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
-    "scheme": "biomechapp",
-    "userInterfaceStyle": "automatic",
+    "scheme": "kinetra",
+    "userInterfaceStyle": "dark",
     "newArchEnabled": true,
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.wafisharif.kinetra"
     },
     "android": {
       "adaptiveIcon": {
@@ -38,11 +39,18 @@
             "backgroundColor": "#000000"
           }
         }
-      ]
+      ],
+      "expo-video"
     ],
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "6c2465b1-14de-44de-9b93-23f5543a2fcc"
+      }
     }
   }
 }

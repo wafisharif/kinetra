@@ -1,0 +1,8 @@
+Flask
+flask-cors
+gunicorn
+opencv-python-headless
+mediapipe
+matplotlib
+numpy
+protobuf

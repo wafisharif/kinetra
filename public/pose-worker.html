@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Pose Worker</title>
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        background: transparent;
+        color: #fff;
+        font: 12px -apple-system, system-ui, sans-serif;
+        overflow: hidden;
+      }
+      #status { padding: 4px 6px; white-space: nowrap; }
+    </style>
+  </head>
+  <body>
+    <div id="status">pose: loading…</div>
+    <canvas id="stage" width="640" height="480"></canvas>
+    <script>
+      (async function () {
+        var statusEl = document.getElementById('status');
+        var canvas = document.getElementById('stage');
+        var ctx = canvas.getContext('2d');
+        var landmarker = null;
+
+        function setStatus(msg) {
+          statusEl.textContent = 'pose: ' + msg;
+        }
+        function post(type, extra) {
+          try {
+            window.ReactNativeWebView.postMessage(
+              JSON.stringify(Object.assign({ type: type }, extra || {}))
+            );
+          } catch (e) {}
+        }
+        function loadImage(src) {
+          return new Promise(function (resolve, reject) {
+            var img = new Image();
+            img.onload = function () { resolve(img); };
+            img.onerror = function () { reject(new Error('image load failed')); };
+            img.src = src;
+          });
+        }
+        async function handleMessage(raw) {
+          var msg;
+          try { msg = typeof raw === 'string' ? JSON.parse(raw) : raw; }
+          catch (e) { return; }
+          if (!msg || msg.type !== 'detect') return;
+          var requestId = msg.requestId;
+          var dataUri = msg.dataUri;
+          if (!landmarker) { post('result', { requestId: requestId, count: 0 }); return; }
+          if (!dataUri) { post('result', { requestId: requestId, count: 0 }); return; }
+          try {
+            var img = await loadImage(dataUri);
+            if (canvas.width !== img.naturalWidth || canvas.height !== img.naturalHeight) {
+              canvas.width = img.naturalWidth;
+              canvas.height = img.naturalHeight;
+            }
+            ctx.drawImage(img, 0, 0);
+            var result = landmarker.detect(canvas);
+            var landmarks = result && result.landmarks && result.landmarks[0];
+            post('result', { requestId: requestId, count: landmarks ? landmarks.length : 0 });
+          } catch (e) {
+            post('error', { message: 'detect failed: ' + (e && e.message ? e.message : String(e)) });
+            post('result', { requestId: requestId, count: 0 });
+          }
+        }
+
+        try {
+          setStatus('loading mediapipe…');
+          // Load MediaPipe as a regular <script> (UMD). This is the only
+          // loading path that works across both iOS and Android WebView
+          // regardless of origin. The UMD build attaches a global to window.
+          await new Promise(function (resolve, reject) {
+            var s = document.createElement('script');
+            s.src = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/vision_bundle.mjs';
+            s.type = 'module';
+            s.onload = function () { resolve(); };
+            s.onerror = function () { reject(new Error('script load failed: ' + s.src)); };
+            document.head.appendChild(s);
+          });
+          // After the module script loads, dynamically import it to get
+          // the actual exports. This is the same pattern MediaPipe ships
+          // in their own samples.
+          var mod = await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/vision_bundle.mjs');
+          var FilesetResolver = mod.FilesetResolver;
+          var PoseLandmarker = mod.PoseLandmarker;
+
+          setStatus('loading wasm…');
+          var fileset = await FilesetResolver.forVisionTasks(
+            'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm'
+          );
+
+          setStatus('loading model…');
+          landmarker = await PoseLandmarker.createFromOptions(fileset, {
+            baseOptions: {
+              modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
+              delegate: 'GPU'
+            },
+            runningMode: 'IMAGE',
+            numPoses: 1
+          });
+
+          setStatus('ready');
+          post('ready');
+
+          window.addEventListener('message', function (event) { handleMessage(event.data); });
+          document.addEventListener('message', function (event) { handleMessage(event.data); });
+        } catch (e) {
+          var message = (e && e.message) ? e.message : String(e);
+          setStatus('error: ' + message);
+          post('error', { message: message });
+        }
+      })();
+    </script>
+  </body>
+</html>
