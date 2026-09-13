@@ -248,6 +248,15 @@ type SavedSession = {
   primary_score: number | null;
   primary_grade: string;
   confidence_grade?: string;
+  // Phase 2: which arm this session analyzed and whether personalized
+  // calibration thresholds were active for it. Optional so old sessions
+  // saved before this field existed still load and render fine.
+  side?: 'left' | 'right';
+  thresholds_calibrated?: boolean;
+  // Phase 3: set only when Team Screening mode was on for this recording --
+  // lets a coach or PE teacher tag a session with which athlete it belongs
+  // to, without needing any separate roster-specific recording flow.
+  athlete_name?: string;
 };
 
 type TesterNote = {
@@ -1834,6 +1843,44 @@ function getRehabTrendScores(sessions: SavedSession[]) {
     .reverse()
     .map((session) => session.primary_score)
     .filter((score): score is number => score !== null);
+}
+
+// Phase 3: Team Screening roster. Groups saved sessions by athlete_name
+// (sessions with no name -- i.e. Team Screening was off -- are excluded
+// entirely, so a coach's roster never mixes in the coach's own solo
+// testing). `savedSessions` is already newest-first (see saveAnalysisSession
+// above), so the first session found per athlete is their most recent.
+function isLowMovementGrade(grade: string) {
+  const lower = grade.toLowerCase();
+  return (
+    lower.includes('poor') ||
+    lower.includes('needs work') ||
+    lower.includes('recheck needed') ||
+    lower.includes('decline')
+  );
+}
+
+function getTeamRoster(sessions: SavedSession[]) {
+  const named = sessions.filter(
+    (session): session is SavedSession & { athlete_name: string } =>
+      !!session.athlete_name && session.athlete_name.trim().length > 0
+  );
+
+  const athleteNames = [...new Set(named.map((session) => session.athlete_name))];
+
+  return athleteNames
+    .map((name) => {
+      const athleteSessions = named.filter((session) => session.athlete_name === name);
+      const latestSession = athleteSessions[0];
+
+      return {
+        name,
+        sessionCount: athleteSessions.length,
+        latestSession,
+        flagged: isLowMovementGrade(latestSession.primary_grade),
+      };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 function getLatestRehabSession(sessions: SavedSession[]) {
@@ -5474,25 +5521,43 @@ export default function HomeScreen() {
   // is exactly the arm the backend always tracked before this selector
   // existed -- so a user who never touches this gets identical behavior.
   const [selectedSide, setSelectedSide] = useState<'left' | 'right'>('right');
-  // Phase 1: optional personalized rep-detection thresholds. null means
-  // "use the backend's built-in default range" (also identical to
-  // pre-Phase-1 behavior). Set once the user calibrates and confirms a
-  // suggestion below; cleared by "Reset to Default Range".
-  const [calibratedThresholds, setCalibratedThresholds] = useState<{
-    flex: number;
-    extend: number;
-  } | null>(null);
+  // Phase 2: optional personalized rep-detection thresholds, stored per arm
+  // (a real, common case for this app's rehab audience: someone's affected
+  // and unaffected arm can have genuinely different ranges of motion, so one
+  // shared calibration for both sides would silently misgrade whichever arm
+  // it wasn't measured from). null for a side means "use the backend's
+  // built-in default range" -- also identical to pre-calibration-feature
+  // behavior. Persisted to AsyncStorage so it survives an app restart;
+  // loaded once on mount by loadCalibration() below.
+  const [calibratedThresholdsBySide, setCalibratedThresholdsBySide] = useState<{
+    left: { flex: number; extend: number } | null;
+    right: { flex: number; extend: number } | null;
+  }>({ left: null, right: null });
+  // The calibration that actually applies to whichever arm is selected
+  // right now -- this is what upload/display code should read.
+  const calibratedThresholds = calibratedThresholdsBySide[selectedSide];
   // True only for the one recording immediately after the user taps
   // "Calibrate My Range" -- tells the result handler to turn that
   // recording's observed angle range into a calibration suggestion instead
   // of just showing normal results.
   const [isCalibrating, setIsCalibrating] = useState(false);
+  // `side` records which arm was actually selected during the calibration
+  // recording, so confirming "Use These" always saves to the correct arm's
+  // slot even if the user switches the arm selector before confirming.
   const [pendingCalibrationSuggestion, setPendingCalibrationSuggestion] = useState<{
+    side: 'left' | 'right';
     flex: number;
     extend: number;
     observedMin: number;
     observedMax: number;
   } | null>(null);
+  // Only show the pending suggestion card while the selector is still on the
+  // arm it was actually measured for -- switching arms hides (not discards)
+  // it, so it reappears correctly if the user switches back.
+  const relevantPendingCalibrationSuggestion =
+    pendingCalibrationSuggestion && pendingCalibrationSuggestion.side === selectedSide
+      ? pendingCalibrationSuggestion
+      : null;
   // Separate from analysisError on purpose: a calibration recording that
   // didn't show enough range of motion is not an analysis failure -- the
   // video analyzed fine and its result is still shown normally. This just
@@ -5506,6 +5571,14 @@ export default function HomeScreen() {
   const [showTestingGuide, setShowTestingGuide] = useState(false);
   const [showFeedbackNotes, setShowFeedbackNotes] = useState(false);
   const [showCameraSetupGuide, setShowCameraSetupGuide] = useState(false);
+  const [showTransparency, setShowTransparency] = useState(false);
+  // Phase 3: Team Screening. When enabled, the athlete name typed below is
+  // attached to the next saved session -- reusing the exact same
+  // single-user recording flow underneath, not a separate pipeline. Team
+  // Roster (below) then aggregates saved sessions by athlete_name.
+  const [teamModeEnabled, setTeamModeEnabled] = useState(false);
+  const [athleteNameInput, setAthleteNameInput] = useState('');
+  const [showTeamRoster, setShowTeamRoster] = useState(false);
   const [showRolloutDashboard, setShowRolloutDashboard] = useState(false);
   const [showGuidedTestWorkflow, setShowGuidedTestWorkflow] = useState(false);
   const [completedGuidedSteps, setCompletedGuidedSteps] = useState<string[]>([]);
@@ -5560,6 +5633,48 @@ export default function HomeScreen() {
     }
   };
 
+  // Phase 2: load any previously-confirmed calibration for either arm so it
+  // survives an app restart. Shape on disk: { left: {flex,extend}|null,
+  // right: {flex,extend}|null }. Any parse failure or unexpected shape falls
+  // back to "no calibration for either side" rather than crashing -- the
+  // app is fully usable with default thresholds either way.
+  const loadCalibration = async () => {
+    try {
+      const raw = await AsyncStorage.getItem('calibrated_thresholds_v1');
+      if (!raw) return;
+
+      const parsed = JSON.parse(raw);
+      const isValidEntry = (entry: any) =>
+        entry === null ||
+        (entry && typeof entry.flex === 'number' && typeof entry.extend === 'number');
+
+      if (parsed && isValidEntry(parsed.left) && isValidEntry(parsed.right)) {
+        setCalibratedThresholdsBySide({
+          left: parsed.left ?? null,
+          right: parsed.right ?? null,
+        });
+      }
+    } catch (error) {
+      console.log('Failed to load calibration:', error);
+    }
+  };
+
+  // Persists one side's calibration (or clears it with value=null) to both
+  // state and AsyncStorage in one place, so the two call sites below can't
+  // drift out of sync with each other.
+  const persistCalibrationForSide = async (
+    side: 'left' | 'right',
+    value: { flex: number; extend: number } | null
+  ) => {
+    const updated = { ...calibratedThresholdsBySide, [side]: value };
+    setCalibratedThresholdsBySide(updated);
+    try {
+      await AsyncStorage.setItem('calibrated_thresholds_v1', JSON.stringify(updated));
+    } catch (error) {
+      console.log('Failed to save calibration:', error);
+    }
+  };
+
   const findPreviousSessionForResult = (result: AnalysisResult) => {
     return savedSessions.find((session) => {
       if (session.mode !== result.mode) return false;
@@ -5598,6 +5713,10 @@ export default function HomeScreen() {
         primary_score: primary.score,
         primary_grade: primary.grade,
         confidence_grade: confidence.grade,
+        side: result.side,
+        thresholds_calibrated: result.calibration_data?.thresholds_calibrated,
+        athlete_name:
+          teamModeEnabled && athleteNameInput.trim() ? athleteNameInput.trim() : undefined,
       };
 
       const updatedSessions = [newSession, ...savedSessions].slice(0, 30);
@@ -5884,6 +6003,7 @@ export default function HomeScreen() {
     loadTesterNotes();
     loadGuidedTestProgress();
     loadOnboardingStatus();
+    loadCalibration();
   }, [requestPermission]);
 
   // ----- On-device pose snapshot loop (Step 1) -----------------------------
@@ -6131,6 +6251,7 @@ export default function HomeScreen() {
         if (typeof min === 'number' && typeof max === 'number' && max - min >= 20) {
           const margin = (max - min) * 0.15;
           setPendingCalibrationSuggestion({
+            side: selectedSide,
             flex: Math.round((min + margin) * 10) / 10,
             extend: Math.round((max - margin) * 10) / 10,
             observedMin: Math.round(min * 10) / 10,
@@ -6683,6 +6804,216 @@ export default function HomeScreen() {
         <Pressable
           style={styles.mainButton}
           onPress={() => setShowFeedbackNotes(false)}
+        >
+          <Text style={styles.buttonText}>Back Home</Text>
+        </Pressable>
+      </ScrollView>
+    );
+  }
+
+  if (showTransparency) {
+    return (
+      <ScrollView
+        style={styles.homeScroll}
+        contentContainerStyle={styles.cameraSetupContent}
+        showsVerticalScrollIndicator={false}
+      >
+        <View style={styles.heroBadge}>
+          <Text style={styles.heroBadgeText}>Transparency</Text>
+        </View>
+
+        <Text style={styles.title}>How Kinetra Actually Measures Movement</Text>
+
+        <Text style={styles.subtitle}>
+          {APP_SAFETY_NOTE}
+        </Text>
+
+        <View style={styles.cameraSetupHeroCard}>
+          <Text style={styles.sectionTitle}>What It Does</Text>
+          <Text style={styles.metricValueLarge}>
+            Kinetra uses your phone camera and Google MediaPipe pose-estimation model to
+            estimate the 2D position of your joints in each video frame, then computes
+            angles, speeds, and consistency from those positions. There is no depth sensor,
+            no motion-capture markers, and no wearable hardware involved -- just video.
+          </Text>
+        </View>
+
+        <View style={styles.cameraSetupCard}>
+          <Text style={styles.sectionTitle}>Known Limitations</Text>
+
+          <Text style={styles.cameraMistakeText}>
+            • A single 2D camera cannot fully resolve depth, so movement directly toward or
+            away from the camera is measured less reliably than side-to-side movement.
+          </Text>
+          <Text style={styles.cameraMistakeText}>
+            • Poor lighting, loose clothing, or a joint leaving the frame all reduce
+            tracking accuracy -- the Camera Setup Guide exists because setup genuinely
+            affects results.
+          </Text>
+          <Text style={styles.cameraMistakeText}>
+            • Rep-detection thresholds are either a general default range or a range you
+            personally calibrated -- calibration is a simple geometric estimate from your
+            own recorded motion, not a clinically validated procedure.
+          </Text>
+          <Text style={styles.cameraMistakeText}>
+            • Kinetra has not been validated against a clinical, marker-based motion-capture
+            system. Camera-only movement analysis is an active, credible area of research
+            (single-camera pose estimation has been used in published gait-assessment
+            studies), but that is a statement about the general approach, not a claim that
+            Kinetra itself has been independently validated.
+          </Text>
+        </View>
+
+        <View style={styles.cameraSetupCard}>
+          <Text style={styles.sectionTitle}>What Has Been Fixed So Far</Text>
+
+          <Text style={styles.cameraMistakeText}>
+            • Scores used to shift depending on the phone recording frame rate for the exact
+            same movement. Velocity is now normalized to a fixed reference rate, so results
+            are comparable across devices.
+          </Text>
+          <Text style={styles.cameraMistakeText}>
+            • The backend used to silently assume everyone was moving their right arm, with
+            no warning if that was not true. There is now an explicit arm selector, threaded
+            through the entire analysis.
+          </Text>
+          <Text style={styles.cameraMistakeText}>
+            • Rep-detection used one fixed range of motion for every person. You can now
+            calibrate it to your own observed range instead, separately for each arm.
+          </Text>
+        </View>
+
+        <View style={styles.cameraSetupCard}>
+          <Text style={styles.sectionTitle}>Your Data</Text>
+          <Text style={styles.metricValueLarge}>
+            Recorded video is uploaded to the analysis server only for the duration of one
+            analysis request and is deleted from the server immediately afterward. Session
+            results (scores, not video) are saved only on your own device. Kinetra does not
+            currently share, sell, or publish your movement data anywhere.
+          </Text>
+        </View>
+
+        <Pressable
+          style={styles.mainButton}
+          onPress={() => setShowTransparency(false)}
+        >
+          <Text style={styles.buttonText}>Back Home</Text>
+        </Pressable>
+      </ScrollView>
+    );
+  }
+
+  if (showTeamRoster) {
+    const roster = getTeamRoster(savedSessions);
+    const flaggedCount = roster.filter((athlete) => athlete.flagged).length;
+
+    return (
+      <ScrollView
+        style={styles.homeScroll}
+        contentContainerStyle={styles.cameraSetupContent}
+        showsVerticalScrollIndicator={false}
+      >
+        <View style={styles.heroBadge}>
+          <Text style={styles.heroBadgeText}>Team Screening</Text>
+        </View>
+
+        <Text style={styles.title}>Team Roster</Text>
+
+        <Text style={styles.subtitle}>
+          Every recording saved with an athlete name shows up here. This is a screening tool,
+          not a diagnosis -- it just tells you who is worth a closer look.
+        </Text>
+
+        {roster.length === 0 ? (
+          <View style={styles.cameraSetupCard}>
+            <Text style={styles.sectionTitle}>No Athletes Yet</Text>
+            <Text style={styles.historyEmptyText}>
+              Turn on Team Screening from the home screen, enter a name before each recording,
+              and athletes will start appearing here after their first saved result.
+            </Text>
+          </View>
+        ) : (
+          <>
+            <View style={styles.cameraSetupHeroCard}>
+              <Text style={styles.sectionTitle}>Roster Summary</Text>
+              <Text style={styles.metricValueLarge}>
+                {roster.length} athlete{roster.length === 1 ? '' : 's'} screened
+                {flaggedCount > 0
+                  ? `, ${flaggedCount} flagged for follow-up`
+                  : ', none currently flagged'}
+              </Text>
+            </View>
+
+            {flaggedCount > 0 ? (
+              <View style={styles.cameraMistakeCard}>
+                <Text style={styles.sectionTitle}>Needs a Closer Look</Text>
+                <Text style={styles.cameraMistakeText}>
+                  A flagged athlete&apos;s most recent result graded poorly or asked for a
+                  recheck. That does not mean an injury -- it means a real person (coach,
+                  athletic trainer, or clinician) should take a look before this athlete
+                  continues normal activity.
+                </Text>
+              </View>
+            ) : null}
+
+            {roster.map((athlete) => {
+              const gradeColors = getGradeColors(athlete.latestSession.primary_grade);
+
+              return (
+                <View
+                  key={athlete.name}
+                  style={[
+                    styles.historyTaskCard,
+                    athlete.flagged
+                      ? { borderColor: 'rgba(248, 113, 113, 0.45)' }
+                      : null,
+                  ]}
+                >
+                  <Text style={styles.historyTaskTitle}>{athlete.name}</Text>
+
+                  <Text style={styles.historyTaskSubtitle}>
+                    {athlete.sessionCount} saved check{athlete.sessionCount === 1 ? '' : 's'}
+                    {athlete.latestSession.side
+                      ? ` -- most recent: ${athlete.latestSession.side} side`
+                      : ''}
+                  </Text>
+
+                  <Text style={styles.metricLabelSmall}>Most Recent Result</Text>
+
+                  <Text style={styles.historyLatestScore}>
+                    {athlete.latestSession.primary_score !== null
+                      ? `${athlete.latestSession.primary_score}/100`
+                      : 'N/A'}
+                  </Text>
+
+                  <View
+                    style={[
+                      styles.gradeBadge,
+                      {
+                        backgroundColor: gradeColors.bg,
+                        borderColor: gradeColors.border,
+                      },
+                    ]}
+                  >
+                    <Text style={[styles.gradeBadgeText, { color: gradeColors.text }]}>
+                      {athlete.latestSession.primary_grade}
+                    </Text>
+                  </View>
+
+                  {athlete.flagged ? (
+                    <Text style={[styles.cameraMistakeText, { marginTop: 10 }]}>
+                      ⚠ Flagged for follow-up
+                    </Text>
+                  ) : null}
+                </View>
+              );
+            })}
+          </>
+        )}
+
+        <Pressable
+          style={styles.mainButton}
+          onPress={() => setShowTeamRoster(false)}
         >
           <Text style={styles.buttonText}>Back Home</Text>
         </Pressable>
@@ -10610,6 +10941,20 @@ export default function HomeScreen() {
             </Pressable>
 
             <Pressable
+              style={styles.howItWorksButton}
+              onPress={() => setShowTransparency(true)}
+            >
+              <Text style={styles.howItWorksButtonText}>Transparency</Text>
+            </Pressable>
+
+            <Pressable
+              style={styles.howItWorksButton}
+              onPress={() => setShowTeamRoster(true)}
+            >
+              <Text style={styles.howItWorksButtonText}>Team Roster</Text>
+            </Pressable>
+
+            <Pressable
               style={styles.dailyHealthTopButton}
               onPress={() => setShowDailyHealthOverview(true)}
             >
@@ -10869,7 +11214,7 @@ export default function HomeScreen() {
                   <Pressable
                     style={[styles.dailyTaskChip, { marginTop: 8, flex: 0, alignSelf: 'flex-start', paddingHorizontal: 14 }]}
                     onPress={() => {
-                      setCalibratedThresholds(null);
+                      persistCalibrationForSide(selectedSide, null);
                       setPendingCalibrationSuggestion(null);
                       setCalibrationMessage(null);
                     }}
@@ -10877,22 +11222,22 @@ export default function HomeScreen() {
                     <Text style={styles.dailyTaskChipText}>Reset to Default Range</Text>
                   </Pressable>
                 </>
-              ) : pendingCalibrationSuggestion ? (
+              ) : relevantPendingCalibrationSuggestion ? (
                 <View style={styles.quickStartBox}>
                   <Text style={styles.quickStartTitle}>Calibration Recording Complete</Text>
                   <Text style={styles.quickStartText}>
-                    We measured your range as {pendingCalibrationSuggestion.observedMin}° to{' '}
-                    {pendingCalibrationSuggestion.observedMax}°. Suggested personalized
-                    thresholds: flexed below {pendingCalibrationSuggestion.flex}°, extended
-                    above {pendingCalibrationSuggestion.extend}°.
+                    We measured your range as {relevantPendingCalibrationSuggestion.observedMin}° to{' '}
+                    {relevantPendingCalibrationSuggestion.observedMax}°. Suggested personalized
+                    thresholds: flexed below {relevantPendingCalibrationSuggestion.flex}°, extended
+                    above {relevantPendingCalibrationSuggestion.extend}°.
                   </Text>
                   <View style={[styles.dailyTaskRow, { marginTop: 10, marginBottom: 0 }]}>
                     <Pressable
                       style={styles.dailyTaskChip}
                       onPress={() => {
-                        setCalibratedThresholds({
-                          flex: pendingCalibrationSuggestion.flex,
-                          extend: pendingCalibrationSuggestion.extend,
+                        persistCalibrationForSide(relevantPendingCalibrationSuggestion.side, {
+                          flex: relevantPendingCalibrationSuggestion.flex,
+                          extend: relevantPendingCalibrationSuggestion.extend,
                         });
                         setPendingCalibrationSuggestion(null);
                       }}
@@ -10930,6 +11275,52 @@ export default function HomeScreen() {
                 </>
               )}
             </View>
+          </View>
+
+          <View style={styles.dailyTaskBlock}>
+            <Text style={styles.dailyTaskTitle}>Team Screening</Text>
+
+            <Text style={styles.dailyTaskDescription}>
+              For a coach or PE teacher screening several athletes with one phone: turn this
+              on, type the athlete&apos;s name before each recording, and every result gets
+              tagged so you can review the whole roster afterward.
+            </Text>
+
+            <Pressable
+              style={[
+                styles.dailyTaskChip,
+                { marginTop: 10, flex: 0, alignSelf: 'flex-start', paddingHorizontal: 14 },
+                teamModeEnabled && styles.dailyTaskChipActive,
+              ]}
+              onPress={() => setTeamModeEnabled(!teamModeEnabled)}
+            >
+              <Text
+                style={[
+                  styles.dailyTaskChipText,
+                  teamModeEnabled && styles.dailyTaskChipTextActive,
+                ]}
+              >
+                {teamModeEnabled ? 'Team Screening: On' : 'Team Screening: Off'}
+              </Text>
+            </Pressable>
+
+            {teamModeEnabled ? (
+              <View style={{ marginTop: 12 }}>
+                <Text style={styles.inputLabel}>Athlete Name</Text>
+                <TextInput
+                  style={styles.feedbackInput}
+                  value={athleteNameInput}
+                  onChangeText={setAthleteNameInput}
+                  placeholder="Example: Jordan, #14, Alex R."
+                  placeholderTextColor="#64748b"
+                />
+                {!athleteNameInput.trim() ? (
+                  <Text style={[styles.dailyTaskDescription, { marginTop: 8 }]}>
+                    Enter a name before recording, or this result will save without one.
+                  </Text>
+                ) : null}
+              </View>
+            ) : null}
           </View>
 
           {mode === 'daily' ? (

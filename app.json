@@ -13,6 +13,7 @@
       "bundleIdentifier": "com.wafisharif.kinetra"
     },
     "android": {
+      "package": "com.wafisharif.kinetra",
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/images/android-icon-foreground.png",
@@ -28,6 +29,14 @@
     },
     "plugins": [
       "expo-router",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Kinetra uses your camera to record short movement clips so it can analyze your form. Nothing is recorded without you starting it.",
+          "microphonePermission": "Kinetra's camera recordings are captured muted -- audio is never recorded or analyzed. This permission exists only because the camera library can technically request it.",
+          "recordAudioAndroid": false
+        }
+      ],
       [
         "expo-splash-screen",
         {
