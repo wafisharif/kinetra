@@ -1,11 +1,12 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import subprocess
 import os
-import json
-import sys
+import time
 import uuid
+from collections import defaultdict, deque
 from pathlib import Path
+
+from pose_test import run_analysis
 
 app = Flask(__name__)
 CORS(app)
@@ -21,6 +22,73 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 POSE_SCRIPT = BASE_DIR / "pose_test.py"
 ANALYSIS_TIMEOUT_SECONDS = int(
     os.environ.get("ANALYSIS_TIMEOUT_SECONDS", "90"))
+
+# ---------------------------------------------------------------------------
+# Cross-platform hard timeout for the analysis call.
+#
+# run_analysis() now runs IN this process (see the note at the top of
+# pose_test.py for why), so we can no longer rely on subprocess.run(...,
+# timeout=...) to kill a stuck analysis. signal.SIGALRM gives us the same
+# guarantee on the platform that actually matters for this: the Linux dyno
+# this is deployed on (Procfile runs a single sync gunicorn worker, so the
+# request is always handled on that worker's main thread -- exactly where
+# SIGALRM works). SIGALRM does not exist on Windows, so when this is run
+# locally for development (`python server.py` on Windows), the timeout is
+# simply not enforced instead of crashing -- your dev videos are short
+# anyway, and the deployed server is what actually needs the guarantee.
+# ---------------------------------------------------------------------------
+import signal  # noqa: E402  (kept near where it's used)
+
+
+def _run_with_timeout(func, timeout_seconds, *args, **kwargs):
+    if not hasattr(signal, "SIGALRM"):
+        return func(*args, **kwargs)
+
+    def _on_alarm(signum, frame):
+        raise TimeoutError(
+            f"Analysis took longer than {timeout_seconds} seconds")
+
+    previous_handler = signal.signal(signal.SIGALRM, _on_alarm)
+    signal.alarm(timeout_seconds)
+    try:
+        return func(*args, **kwargs)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
+# ---------------------------------------------------------------------------
+# Minimal best-effort rate limiting.
+#
+# This is NOT hardened security (a client can spoof X-Forwarded-For), but
+# /analyze currently has no auth at all and runs a real video-processing
+# pipeline per request -- this is just a cheap guard against one script
+# flooding the single worker with requests, not a defense against a
+# determined attacker. Revisit with real auth before this is used beyond
+# your own testing/beta group.
+# ---------------------------------------------------------------------------
+RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", "20"))
+RATE_LIMIT_WINDOW_SECONDS = int(
+    os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "600"))
+_request_log = defaultdict(deque)
+
+
+def _is_rate_limited(client_key: str) -> bool:
+    now = time.time()
+    q = _request_log[client_key]
+    while q and now - q[0] > RATE_LIMIT_WINDOW_SECONDS:
+        q.popleft()
+    if len(q) >= RATE_LIMIT_MAX_REQUESTS:
+        return True
+    q.append(now)
+    return False
+
+
+def _client_key() -> str:
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.remote_addr or "unknown"
 
 
 @app.route("/", methods=["GET"])
@@ -53,18 +121,28 @@ def file_too_large(error):
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
+    if _is_rate_limited(_client_key()):
+        return jsonify({
+            "error": "Too many requests",
+            "details": f"Limit is {RATE_LIMIT_MAX_REQUESTS} analyses per {RATE_LIMIT_WINDOW_SECONDS} seconds. Try again shortly."
+        }), 429
+
     if "video" not in request.files:
         return jsonify({"error": "No video uploaded"}), 400
-
-    if not POSE_SCRIPT.exists():
-        return jsonify({
-            "error": "Backend misconfigured",
-            "details": "pose_test.py was not found on the server."
-        }), 500
 
     file = request.files["video"]
     mode = request.form.get("mode", "rep")
     daily_task = request.form.get("daily_task", "reach")
+    # Optional Phase 1 additions. Both default to exactly what run_analysis()
+    # itself defaults to when a field is entirely absent from the request,
+    # so an older/unmodified frontend client that never sends these gets
+    # byte-identical behavior to before they existed. run_analysis() does
+    # its own validation and safe fallback for malformed values (an
+    # unrecognized side, a non-numeric or degenerate threshold pair), so
+    # raw form values are passed through as-is rather than re-validated here.
+    side = request.form.get("side", "right")
+    flex_threshold = request.form.get("flex_threshold")
+    extend_threshold = request.form.get("extend_threshold")
 
     if file.filename == "":
         return jsonify({
@@ -78,68 +156,47 @@ def analyze():
     try:
         file.save(filepath)
 
-        env = os.environ.copy()
-        env["BACKEND_MODE"] = "1"
-        env["VIDEO_PATH"] = str(filepath)
-        env["MODE"] = mode
-        env["DAILY_TASK"] = daily_task
-
-        result = subprocess.run(
-            [sys.executable, str(POSE_SCRIPT)],
-            capture_output=True,
-            text=True,
-            env=env,
-            cwd=str(BASE_DIR),
-            timeout=ANALYSIS_TIMEOUT_SECONDS
-        )
-
         print("\n=== ANALYSIS REQUEST ===")
         print(f"mode={mode}")
         print(f"daily_task={daily_task}")
+        print(f"side={side}")
+        print(f"flex_threshold={flex_threshold} extend_threshold={extend_threshold}")
         print(f"video={filepath}")
 
-        print("\n=== STDOUT ===")
-        print(result.stdout)
+        result_data = _run_with_timeout(
+            run_analysis,
+            ANALYSIS_TIMEOUT_SECONDS,
+            video_path=str(filepath),
+            mode=mode,
+            daily_task=daily_task,
+            output_csv=str(BASE_DIR / "elbow_angles.csv"),
+            backend_mode=True,
+            side=side,
+            flex_threshold=flex_threshold,
+            extend_threshold=extend_threshold,
+        )
 
-        print("\n=== STDERR ===")
-        print(result.stderr)
+        print("=== ANALYSIS OK ===")
+        print(f"total_frames={result_data.get('total_frames')} "
+              f"movement_health_score={result_data.get('movement_health_score')}")
 
-        if result.returncode != 0:
-            return jsonify({
-                "error": "Analysis script failed",
-                "details": f"pose_test.py exited with code {result.returncode}",
-                "stderr": result.stderr,
-                "raw_output": result.stdout
-            }), 500
+        return jsonify(result_data), 200
 
-        output = result.stdout.strip()
-
-        if not output:
-            return jsonify({
-                "error": "Empty analysis output",
-                "details": "pose_test.py did not return JSON output.",
-                "stderr": result.stderr
-            }), 500
-
-        try:
-            parsed = json.loads(output)
-        except Exception as e:
-            return jsonify({
-                "error": "Processing failed",
-                "details": str(e),
-                "stderr": result.stderr,
-                "raw_output": result.stdout
-            }), 500
-
-        return jsonify(parsed), 200
-
-    except subprocess.TimeoutExpired:
+    except TimeoutError:
         return jsonify({
             "error": "Analysis timeout",
             "details": f"Analysis took longer than {ANALYSIS_TIMEOUT_SECONDS} seconds. Try a shorter video."
         }), 504
 
+    except RuntimeError as e:
+        # Raised by run_analysis() itself, e.g. an unreadable/corrupt video.
+        return jsonify({
+            "error": "Analysis failed",
+            "details": str(e)
+        }), 500
+
     except Exception as e:
+        print(f"Unexpected error during analysis: {e}")
         return jsonify({
             "error": "Server error",
             "details": str(e)

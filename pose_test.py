@@ -1,6 +1,5 @@
 import os
 import json
-import matplotlib.pyplot as plt
 import cv2
 import mediapipe.python.solutions.pose as mp_pose
 import mediapipe.python.solutions.drawing_utils as mp_drawing
@@ -9,15 +8,22 @@ import csv
 from typing import Any, Dict
 
 # -----------------------------
-# CONFIG
+# NOTE ON THIS REFACTOR (server-safe import)
 # -----------------------------
-BACKEND_MODE = os.getenv("BACKEND_MODE", "0") == "1"
-video_path = os.getenv("VIDEO_PATH", "test_video.mp4")
-output_csv = os.getenv("OUTPUT_CSV", "elbow_angles.csv")
-MODE = os.getenv("MODE", "rep")
-DAILY_TASK = os.getenv("DAILY_TASK", "reach")
-
-pose = mp_pose.Pose()
+# This module used to run its entire analysis as top-level script code,
+# which meant the only safe way for server.py to use it was to spawn a
+# brand-new subprocess per request -- re-importing mediapipe/opencv/
+# matplotlib and rebuilding the pose model from scratch every single time.
+# The analysis logic now lives in run_analysis(), which server.py imports
+# once and calls directly in-process. A fresh mediapipe Pose() is still
+# created (and closed) on every call, so temporal-smoothing state from one
+# video can never leak into the next. Running this file directly
+# (`python pose_test.py`) behaves exactly as before -- same env vars, same
+# stdout contract, same exit code on a bad video path.
+#
+# matplotlib is imported lazily inside run_analysis(), only on the
+# interactive (non-backend) path, so importing/using this module from a
+# server never pays for that import.
 
 # -----------------------------
 # ANGLE CALCULATION
@@ -2185,688 +2191,872 @@ def safe_float(x):
     return float(x) if x is not None else None
 
 
-# -----------------------------
-# VIDEO PROCESSING
-# -----------------------------
-cap = cv2.VideoCapture(video_path)
+DEFAULT_FLEX_THRESHOLD = 95
+DEFAULT_EXTEND_THRESHOLD = 115
 
-fps = cap.get(cv2.CAP_PROP_FPS)
 
-if fps is None or fps == 0:
-    fps = 30.0
+def run_analysis(video_path, mode="rep", daily_task="reach", output_csv="elbow_angles.csv", backend_mode=True, side="right", flex_threshold=None, extend_threshold=None):
+    """
+    Run the full pose-based movement analysis on one video and return the
+    result dict -- the same shape server.py previously got back (as JSON on
+    stdout) from the pose_test.py subprocess. Raises RuntimeError if the
+    video can't be opened. Safe to call repeatedly from a long-lived process
+    (e.g. a Flask server): a fresh mediapipe Pose() is created and closed on
+    every call.
 
-fps = float(fps)
+    side: "left" or "right" (case-insensitive; anything else falls back to
+    "right"). Selects which arm's shoulder/elbow/wrist landmarks feed the
+    elbow-flexion angle signal (`angle` / `angles` / `smoothed_angles` /
+    `angular_velocity`) that this file has always computed on every frame,
+    in every mode -- so `side` affects: the top-level global_metrics /
+    rep_analysis / movement_health_score / score_trend / best_rep /
+    worst_rep / max_extension_speed / max_flexion_speed fields (present
+    regardless of `mode`/`daily_task`, exactly as before this parameter
+    existed), plus the reach and arm-raise daily-task summaries, which are
+    also built from this arm. Defaults to "right" so any existing caller
+    that never passes `side` -- the app's current frontend, saved
+    test/regression scripts -- gets byte-identical output to before this
+    parameter existed.
 
-if not cap.isOpened():
-    error_result = {
-        "error": f"Could not open video: {video_path}"
-    }
-    if BACKEND_MODE:
-        print(json.dumps(error_result))
+    `side` never affects `task_analysis` (the dedicated per-task summary
+    returned for daily_task modes) for the whole-body/leg-dominant tasks --
+    sit-to-stand, walking, balance, timed-up-and-go -- since those are
+    built separately from true anatomical left_hip/right_hip/left_knee/
+    right_knee/etc. and a fixed right-side torso reference, independent of
+    which arm is being tested. Verified byte-identical between side="left"
+    and side="right" for all four.
+
+    flex_threshold / extend_threshold: elbow angle (degrees) boundaries used
+    to detect flexion<->extension transitions for rep counting
+    (count_reps_bidirectional / get_transition_indices below). Both default
+    to None, which means "use this file's original hardcoded values"
+    (DEFAULT_FLEX_THRESHOLD=95, DEFAULT_EXTEND_THRESHOLD=115) -- so any
+    existing caller that never passes these gets byte-identical rep
+    counting to before this parameter existed. Pass both together (a
+    calibration step should derive them from a user's own observed range of
+    motion, e.g. a comfortable margin inside their actual min/max angle) to
+    tune rep detection for a specific person's mobility instead of assuming
+    a fixed able-bodied range -- particularly relevant for rehab patients
+    with a reduced range of motion who might otherwise never register a rep.
+    If the two values are missing, non-numeric, or would make flex >=
+    extend (a nonsensical/degenerate window), this silently falls back to
+    the built-in defaults rather than producing broken rep detection --
+    calibration input should never be able to break analysis.
+    """
+    def _valid_threshold_pair(flex_val, extend_val):
+        try:
+            flex_num = float(flex_val)
+            extend_num = float(extend_val)
+        except (TypeError, ValueError):
+            return None
+        if not (flex_num < extend_num):
+            return None
+        return flex_num, extend_num
+
+    _pair = _valid_threshold_pair(flex_threshold, extend_threshold)
+    if _pair is None:
+        resolved_flex_threshold = DEFAULT_FLEX_THRESHOLD
+        resolved_extend_threshold = DEFAULT_EXTEND_THRESHOLD
+        thresholds_calibrated = False
     else:
-        print(f"Error: Could not open video: {video_path}")
-    raise SystemExit(1)
-
-frame_index = 0
-angle_data = []
-
-# -----------------------------
-# TASK-SPECIFIC SIGNAL STORAGE
-# -----------------------------
-task_signal_data = {
-    # Sit-to-Stand
-    "right_knee_angles": [],
-    "right_hip_angles": [],
-    "torso_lean_values": [],
-    "sit_to_stand_valid_frames": 0,
-
-    # Reach
-    "reach_distances": [],
-    "reach_x_positions": [],
-    "reach_y_positions": [],
-    "reach_valid_frames": 0,
-
-    # Arm Raise
-    "arm_raise_vertical_positions": [],
-    "arm_raise_distances": [],
-    "arm_raise_elbow_angles": [],
-    "arm_raise_valid_frames": 0,
-
-    # Walking
-    "walking_hip_center_x": [],
-    "walking_hip_center_y": [],
-    "walking_left_ankle_y": [],
-    "walking_right_ankle_y": [],
-    "walking_left_knee_angles": [],
-    "walking_right_knee_angles": [],
-    "walking_step_signal": [],
-    "walking_valid_frames": 0,
-
-    # Balance
-    "balance_hip_center_x": [],
-    "balance_hip_center_y": [],
-    "balance_shoulder_center_x": [],
-    "balance_shoulder_center_y": [],
-    "balance_torso_lean": [],
-    "balance_ankle_center_x": [],
-    "balance_support_width": [],
-    "balance_valid_frames": 0,
-
-    # Timed Up and Go
-    "tug_hip_center_x": [],
-    "tug_hip_center_y": [],
-    "tug_right_knee_angles": [],
-    "tug_right_hip_angles": [],
-    "tug_torso_lean": [],
-    "tug_step_signal": [],
-    "tug_valid_frames": 0
-}
-
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
-
-    image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = pose.process(image_rgb)
-
-    angle = None
-
-    pose_landmarks = getattr(results, "pose_landmarks", None)
-
-    if pose_landmarks is not None:
-        if not BACKEND_MODE:
-            mp_drawing.draw_landmarks(
-                frame,
-                pose_landmarks,
-                getattr(mp_pose, "POSE_CONNECTIONS")
-            )
-
-        landmarks = pose_landmarks.landmark
-
-        shoulder = [
-            landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x,
-            landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y
-        ]
-        elbow = [
-            landmarks[mp_pose.PoseLandmark.RIGHT_ELBOW.value].x,
-            landmarks[mp_pose.PoseLandmark.RIGHT_ELBOW.value].y
-        ]
-        wrist = [
-            landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value].x,
-            landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value].y
-        ]
-
-        left_shoulder = [
-            landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x,
-            landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y
-        ]
-
-        # -----------------------------
-        # SIT-TO-STAND TASK LANDMARKS
-        # -----------------------------
-        right_hip = [
-            landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].x,
-            landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].y
-        ]
-
-        right_knee = [
-            landmarks[mp_pose.PoseLandmark.RIGHT_KNEE.value].x,
-            landmarks[mp_pose.PoseLandmark.RIGHT_KNEE.value].y
-        ]
-
-        right_ankle = [
-            landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x,
-            landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y
-        ]
-
-        left_hip = [
-            landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].x,
-            landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].y
-        ]
-
-        left_knee = [
-            landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].x,
-            landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].y
-        ]
-
-        left_ankle = [
-            landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value].x,
-            landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value].y
-        ]
-
-        angle = calculate_angle(shoulder, elbow, wrist)
-
-        # -----------------------------
-        # SIT-TO-STAND TASK SIGNALS
-        # -----------------------------
-        if MODE == "daily" and DAILY_TASK == "sit_to_stand":
-            right_knee_angle = calculate_angle(
-                right_hip, right_knee, right_ankle)
-            right_hip_angle = calculate_angle(shoulder, right_hip, right_knee)
-            torso_lean = calculate_torso_lean(shoulder, right_hip)
-
-            task_signal_data["right_knee_angles"].append(right_knee_angle)
-            task_signal_data["right_hip_angles"].append(right_hip_angle)
-            task_signal_data["torso_lean_values"].append(torso_lean)
-
-            if right_knee_angle is not None and right_hip_angle is not None and torso_lean is not None:
-                task_signal_data["sit_to_stand_valid_frames"] += 1
-
-        # -----------------------------
-        # REACH TASK SIGNALS
-        # -----------------------------
-        if MODE == "daily" and DAILY_TASK == "reach":
-
-            reach_distance = np.linalg.norm(
-                np.array(wrist) - np.array(shoulder)
-            )
-
-            task_signal_data["reach_distances"].append(float(reach_distance))
-            task_signal_data["reach_x_positions"].append(float(wrist[0]))
-            task_signal_data["reach_y_positions"].append(float(wrist[1]))
-
-            task_signal_data["reach_valid_frames"] += 1
-
-        if angle is not None and not BACKEND_MODE:
-            h, w, _ = frame.shape
-            cx = int(elbow[0] * w)
-            cy = int(elbow[1] * h)
-
-            cv2.putText(
-                frame,
-                f"{int(angle)} deg",
-                (cx, cy),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 0),
-                2,
-                cv2.LINE_AA
-            )
-
-        # -----------------------------
-        # ARM RAISE TASK SIGNALS
-        # -----------------------------
-        if MODE == "daily" and DAILY_TASK == "arm_raise":
-
-            # In image coordinates, y gets smaller when the wrist moves upward.
-            # shoulder_y - wrist_y becomes larger when the arm is raised.
-            arm_vertical_position = shoulder[1] - wrist[1]
-
-            arm_distance = np.linalg.norm(
-                np.array(wrist) - np.array(shoulder)
-            )
-
-            task_signal_data["arm_raise_vertical_positions"].append(
-                float(arm_vertical_position)
-            )
-            task_signal_data["arm_raise_distances"].append(float(arm_distance))
-            task_signal_data["arm_raise_elbow_angles"].append(angle)
-
-            if angle is not None:
-                task_signal_data["arm_raise_valid_frames"] += 1
-
-        # -----------------------------
-        # WALKING TASK SIGNALS
-        # -----------------------------
-        if MODE == "daily" and DAILY_TASK == "walking":
-            hip_center_x = (left_hip[0] + right_hip[0]) / 2
-            hip_center_y = (left_hip[1] + right_hip[1]) / 2
-
-            left_knee_angle = calculate_angle(left_hip, left_knee, left_ankle)
-            right_knee_angle = calculate_angle(
-                right_hip, right_knee, right_ankle)
-
-            # This simple signal compares left/right ankle vertical motion.
-            # During walking, the two ankles should alternate.
-            step_signal = left_ankle[1] - right_ankle[1]
-
-            task_signal_data["walking_hip_center_x"].append(
-                float(hip_center_x))
-            task_signal_data["walking_hip_center_y"].append(
-                float(hip_center_y))
-            task_signal_data["walking_left_ankle_y"].append(
-                float(left_ankle[1]))
-            task_signal_data["walking_right_ankle_y"].append(
-                float(right_ankle[1]))
-            task_signal_data["walking_left_knee_angles"].append(
-                left_knee_angle)
-            task_signal_data["walking_right_knee_angles"].append(
-                right_knee_angle)
-            task_signal_data["walking_step_signal"].append(float(step_signal))
-
-            if left_knee_angle is not None and right_knee_angle is not None:
-                task_signal_data["walking_valid_frames"] += 1
-
-        # -----------------------------
-        # BALANCE TASK SIGNALS
-        # -----------------------------
-        if MODE == "daily" and DAILY_TASK == "balance":
-            hip_center_x = (left_hip[0] + right_hip[0]) / 2
-            hip_center_y = (left_hip[1] + right_hip[1]) / 2
-
-            shoulder_center_x = (left_shoulder[0] + shoulder[0]) / 2
-            shoulder_center_y = (left_shoulder[1] + shoulder[1]) / 2
-
-            ankle_center_x = (left_ankle[0] + right_ankle[0]) / 2
-            support_width = abs(left_ankle[0] - right_ankle[0])
-
-            torso_lean = calculate_torso_lean(
-                [shoulder_center_x, shoulder_center_y],
-                [hip_center_x, hip_center_y]
-            )
-
-            task_signal_data["balance_hip_center_x"].append(
-                float(hip_center_x))
-            task_signal_data["balance_hip_center_y"].append(
-                float(hip_center_y))
-            task_signal_data["balance_shoulder_center_x"].append(
-                float(shoulder_center_x))
-            task_signal_data["balance_shoulder_center_y"].append(
-                float(shoulder_center_y))
-            task_signal_data["balance_ankle_center_x"].append(
-                float(ankle_center_x))
-            task_signal_data["balance_support_width"].append(
-                float(support_width))
-            task_signal_data["balance_torso_lean"].append(torso_lean)
-
-            if torso_lean is not None:
-                task_signal_data["balance_valid_frames"] += 1
-
-        # -----------------------------
-        # TIMED UP AND GO TASK SIGNALS
-        # -----------------------------
-        if MODE == "daily" and DAILY_TASK == "timed_up_and_go":
-            hip_center_x = (left_hip[0] + right_hip[0]) / 2
-            hip_center_y = (left_hip[1] + right_hip[1]) / 2
-
-            right_knee_angle = calculate_angle(
-                right_hip, right_knee, right_ankle
-            )
-            right_hip_angle = calculate_angle(
-                shoulder, right_hip, right_knee
-            )
-
-            torso_lean = calculate_torso_lean(shoulder, right_hip)
-
-            # Left/right ankle vertical difference gives a rough stepping signal.
-            step_signal = left_ankle[1] - right_ankle[1]
-
-            task_signal_data["tug_hip_center_x"].append(float(hip_center_x))
-            task_signal_data["tug_hip_center_y"].append(float(hip_center_y))
-            task_signal_data["tug_right_knee_angles"].append(right_knee_angle)
-            task_signal_data["tug_right_hip_angles"].append(right_hip_angle)
-            task_signal_data["tug_torso_lean"].append(torso_lean)
-            task_signal_data["tug_step_signal"].append(float(step_signal))
-
-            if (
-                right_knee_angle is not None
-                and right_hip_angle is not None
-                and torso_lean is not None
-            ):
-                task_signal_data["tug_valid_frames"] += 1
-
-    angle_data.append([frame_index, angle])
-
-    if not BACKEND_MODE:
-        cv2.imshow("Biomechanics Analysis", frame)
-
-        if cv2.waitKey(20) & 0xFF == ord('q'):
-            break
-
-    frame_index += 1
-
-cap.release()
-
-if not BACKEND_MODE:
-    cv2.destroyAllWindows()
-
-
-# -----------------------------
-# DATA PROCESSING
-# -----------------------------
-angles = [row[1] for row in angle_data]
-signal_quality = compute_signal_quality(angles)
-smoothed_angles = moving_average(angles, window_size=5)
-
-
-# -----------------------------
-# ANGULAR VELOCITY
-# -----------------------------
-angular_velocity = []
-
-for i in range(len(smoothed_angles)):
-    if i == 0 or smoothed_angles[i] is None or smoothed_angles[i - 1] is None:
-        angular_velocity.append(None)
+        resolved_flex_threshold, resolved_extend_threshold = _pair
+        thresholds_calibrated = True
+
+    normalized_side = str(side).strip().lower() if side else "right"
+    if normalized_side not in ("left", "right"):
+        normalized_side = "right"
+
+    if normalized_side == "left":
+        ARM_SHOULDER_LM = mp_pose.PoseLandmark.LEFT_SHOULDER
+        ARM_ELBOW_LM = mp_pose.PoseLandmark.LEFT_ELBOW
+        ARM_WRIST_LM = mp_pose.PoseLandmark.LEFT_WRIST
     else:
-        angular_velocity.append(smoothed_angles[i] - smoothed_angles[i - 1])
+        ARM_SHOULDER_LM = mp_pose.PoseLandmark.RIGHT_SHOULDER
+        ARM_ELBOW_LM = mp_pose.PoseLandmark.RIGHT_ELBOW
+        ARM_WRIST_LM = mp_pose.PoseLandmark.RIGHT_WRIST
+
+    pose = mp_pose.Pose()
+    cap = None
+    try:
+        # -----------------------------
+        # VIDEO PROCESSING
+        # -----------------------------
+        cap = cv2.VideoCapture(video_path)
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+
+        if fps is None or fps == 0:
+            fps = 30.0
+
+        fps = float(fps)
+
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open video: {video_path}")
+
+        frame_index = 0
+        angle_data = []
+
+        # -----------------------------
+        # TASK-SPECIFIC SIGNAL STORAGE
+        # -----------------------------
+        task_signal_data = {
+            # Sit-to-Stand
+            "right_knee_angles": [],
+            "right_hip_angles": [],
+            "torso_lean_values": [],
+            "sit_to_stand_valid_frames": 0,
+
+            # Reach
+            "reach_distances": [],
+            "reach_x_positions": [],
+            "reach_y_positions": [],
+            "reach_valid_frames": 0,
+
+            # Arm Raise
+            "arm_raise_vertical_positions": [],
+            "arm_raise_distances": [],
+            "arm_raise_elbow_angles": [],
+            "arm_raise_valid_frames": 0,
+
+            # Walking
+            "walking_hip_center_x": [],
+            "walking_hip_center_y": [],
+            "walking_left_ankle_y": [],
+            "walking_right_ankle_y": [],
+            "walking_left_knee_angles": [],
+            "walking_right_knee_angles": [],
+            "walking_step_signal": [],
+            "walking_valid_frames": 0,
+
+            # Balance
+            "balance_hip_center_x": [],
+            "balance_hip_center_y": [],
+            "balance_shoulder_center_x": [],
+            "balance_shoulder_center_y": [],
+            "balance_torso_lean": [],
+            "balance_ankle_center_x": [],
+            "balance_support_width": [],
+            "balance_valid_frames": 0,
+
+            # Timed Up and Go
+            "tug_hip_center_x": [],
+            "tug_hip_center_y": [],
+            "tug_right_knee_angles": [],
+            "tug_right_hip_angles": [],
+            "tug_torso_lean": [],
+            "tug_step_signal": [],
+            "tug_valid_frames": 0
+        }
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = pose.process(image_rgb)
+
+            angle = None
+
+            pose_landmarks = getattr(results, "pose_landmarks", None)
+
+            if pose_landmarks is not None:
+                if not backend_mode:
+                    mp_drawing.draw_landmarks(
+                        frame,
+                        pose_landmarks,
+                        getattr(mp_pose, "POSE_CONNECTIONS")
+                    )
+
+                landmarks = pose_landmarks.landmark
+
+                # Fixed right-side torso reference -- used only by the
+                # whole-body/bilateral tasks (sit-to-stand, balance,
+                # timed-up-and-go) below, paired with their own right_hip /
+                # right_knee. Always the literal right shoulder regardless
+                # of `side`, so those tasks are byte-identical to before
+                # the side selector existed.
+                torso_shoulder = [
+                    landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x,
+                    landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y
+                ]
+
+                # Side-selected arm landmarks -- used only by single-arm
+                # metrics: the elbow-flexion angle (rep/rehab/lab mode) and
+                # the reach / arm-raise daily tasks. Equal to torso_shoulder
+                # / RIGHT_ELBOW / RIGHT_WRIST when side="right" (the
+                # default), so existing behavior is unchanged unless a
+                # caller explicitly asks for the left arm.
+                arm_shoulder = [
+                    landmarks[ARM_SHOULDER_LM.value].x,
+                    landmarks[ARM_SHOULDER_LM.value].y
+                ]
+                arm_elbow = [
+                    landmarks[ARM_ELBOW_LM.value].x,
+                    landmarks[ARM_ELBOW_LM.value].y
+                ]
+                arm_wrist = [
+                    landmarks[ARM_WRIST_LM.value].x,
+                    landmarks[ARM_WRIST_LM.value].y
+                ]
+
+                left_shoulder = [
+                    landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x,
+                    landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y
+                ]
+
+                # -----------------------------
+                # SIT-TO-STAND TASK LANDMARKS
+                # -----------------------------
+                right_hip = [
+                    landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].x,
+                    landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].y
+                ]
+
+                right_knee = [
+                    landmarks[mp_pose.PoseLandmark.RIGHT_KNEE.value].x,
+                    landmarks[mp_pose.PoseLandmark.RIGHT_KNEE.value].y
+                ]
+
+                right_ankle = [
+                    landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x,
+                    landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y
+                ]
+
+                left_hip = [
+                    landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].x,
+                    landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].y
+                ]
+
+                left_knee = [
+                    landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].x,
+                    landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].y
+                ]
+
+                left_ankle = [
+                    landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value].x,
+                    landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value].y
+                ]
+
+                angle = calculate_angle(arm_shoulder, arm_elbow, arm_wrist)
+
+                # -----------------------------
+                # SIT-TO-STAND TASK SIGNALS
+                # -----------------------------
+                if mode == "daily" and daily_task == "sit_to_stand":
+                    right_knee_angle = calculate_angle(
+                        right_hip, right_knee, right_ankle)
+                    right_hip_angle = calculate_angle(torso_shoulder, right_hip, right_knee)
+                    torso_lean = calculate_torso_lean(torso_shoulder, right_hip)
+
+                    task_signal_data["right_knee_angles"].append(right_knee_angle)
+                    task_signal_data["right_hip_angles"].append(right_hip_angle)
+                    task_signal_data["torso_lean_values"].append(torso_lean)
+
+                    if right_knee_angle is not None and right_hip_angle is not None and torso_lean is not None:
+                        task_signal_data["sit_to_stand_valid_frames"] += 1
+
+                # -----------------------------
+                # REACH TASK SIGNALS
+                # -----------------------------
+                if mode == "daily" and daily_task == "reach":
+
+                    reach_distance = np.linalg.norm(
+                        np.array(arm_wrist) - np.array(arm_shoulder)
+                    )
+
+                    task_signal_data["reach_distances"].append(float(reach_distance))
+                    task_signal_data["reach_x_positions"].append(float(arm_wrist[0]))
+                    task_signal_data["reach_y_positions"].append(float(arm_wrist[1]))
+
+                    task_signal_data["reach_valid_frames"] += 1
+
+                if angle is not None and not backend_mode:
+                    h, w, _ = frame.shape
+                    cx = int(arm_elbow[0] * w)
+                    cy = int(arm_elbow[1] * h)
+
+                    cv2.putText(
+                        frame,
+                        f"{int(angle)} deg",
+                        (cx, cy),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (0, 255, 0),
+                        2,
+                        cv2.LINE_AA
+                    )
+
+                # -----------------------------
+                # ARM RAISE TASK SIGNALS
+                # -----------------------------
+                if mode == "daily" and daily_task == "arm_raise":
+
+                    # In image coordinates, y gets smaller when the wrist moves upward.
+                    # shoulder_y - wrist_y becomes larger when the arm is raised.
+                    arm_vertical_position = arm_shoulder[1] - arm_wrist[1]
+
+                    arm_distance = np.linalg.norm(
+                        np.array(arm_wrist) - np.array(arm_shoulder)
+                    )
+
+                    task_signal_data["arm_raise_vertical_positions"].append(
+                        float(arm_vertical_position)
+                    )
+                    task_signal_data["arm_raise_distances"].append(float(arm_distance))
+                    task_signal_data["arm_raise_elbow_angles"].append(angle)
+
+                    if angle is not None:
+                        task_signal_data["arm_raise_valid_frames"] += 1
+
+                # -----------------------------
+                # WALKING TASK SIGNALS
+                # -----------------------------
+                if mode == "daily" and daily_task == "walking":
+                    hip_center_x = (left_hip[0] + right_hip[0]) / 2
+                    hip_center_y = (left_hip[1] + right_hip[1]) / 2
+
+                    left_knee_angle = calculate_angle(left_hip, left_knee, left_ankle)
+                    right_knee_angle = calculate_angle(
+                        right_hip, right_knee, right_ankle)
+
+                    # This simple signal compares left/right ankle vertical motion.
+                    # During walking, the two ankles should alternate.
+                    step_signal = left_ankle[1] - right_ankle[1]
+
+                    task_signal_data["walking_hip_center_x"].append(
+                        float(hip_center_x))
+                    task_signal_data["walking_hip_center_y"].append(
+                        float(hip_center_y))
+                    task_signal_data["walking_left_ankle_y"].append(
+                        float(left_ankle[1]))
+                    task_signal_data["walking_right_ankle_y"].append(
+                        float(right_ankle[1]))
+                    task_signal_data["walking_left_knee_angles"].append(
+                        left_knee_angle)
+                    task_signal_data["walking_right_knee_angles"].append(
+                        right_knee_angle)
+                    task_signal_data["walking_step_signal"].append(float(step_signal))
+
+                    if left_knee_angle is not None and right_knee_angle is not None:
+                        task_signal_data["walking_valid_frames"] += 1
+
+                # -----------------------------
+                # BALANCE TASK SIGNALS
+                # -----------------------------
+                if mode == "daily" and daily_task == "balance":
+                    hip_center_x = (left_hip[0] + right_hip[0]) / 2
+                    hip_center_y = (left_hip[1] + right_hip[1]) / 2
+
+                    shoulder_center_x = (left_shoulder[0] + torso_shoulder[0]) / 2
+                    shoulder_center_y = (left_shoulder[1] + torso_shoulder[1]) / 2
+
+                    ankle_center_x = (left_ankle[0] + right_ankle[0]) / 2
+                    support_width = abs(left_ankle[0] - right_ankle[0])
+
+                    torso_lean = calculate_torso_lean(
+                        [shoulder_center_x, shoulder_center_y],
+                        [hip_center_x, hip_center_y]
+                    )
+
+                    task_signal_data["balance_hip_center_x"].append(
+                        float(hip_center_x))
+                    task_signal_data["balance_hip_center_y"].append(
+                        float(hip_center_y))
+                    task_signal_data["balance_shoulder_center_x"].append(
+                        float(shoulder_center_x))
+                    task_signal_data["balance_shoulder_center_y"].append(
+                        float(shoulder_center_y))
+                    task_signal_data["balance_ankle_center_x"].append(
+                        float(ankle_center_x))
+                    task_signal_data["balance_support_width"].append(
+                        float(support_width))
+                    task_signal_data["balance_torso_lean"].append(torso_lean)
+
+                    if torso_lean is not None:
+                        task_signal_data["balance_valid_frames"] += 1
+
+                # -----------------------------
+                # TIMED UP AND GO TASK SIGNALS
+                # -----------------------------
+                if mode == "daily" and daily_task == "timed_up_and_go":
+                    hip_center_x = (left_hip[0] + right_hip[0]) / 2
+                    hip_center_y = (left_hip[1] + right_hip[1]) / 2
+
+                    right_knee_angle = calculate_angle(
+                        right_hip, right_knee, right_ankle
+                    )
+                    right_hip_angle = calculate_angle(
+                        torso_shoulder, right_hip, right_knee
+                    )
+
+                    torso_lean = calculate_torso_lean(torso_shoulder, right_hip)
+
+                    # Left/right ankle vertical difference gives a rough stepping signal.
+                    step_signal = left_ankle[1] - right_ankle[1]
+
+                    task_signal_data["tug_hip_center_x"].append(float(hip_center_x))
+                    task_signal_data["tug_hip_center_y"].append(float(hip_center_y))
+                    task_signal_data["tug_right_knee_angles"].append(right_knee_angle)
+                    task_signal_data["tug_right_hip_angles"].append(right_hip_angle)
+                    task_signal_data["tug_torso_lean"].append(torso_lean)
+                    task_signal_data["tug_step_signal"].append(float(step_signal))
+
+                    if (
+                        right_knee_angle is not None
+                        and right_hip_angle is not None
+                        and torso_lean is not None
+                    ):
+                        task_signal_data["tug_valid_frames"] += 1
+
+            angle_data.append([frame_index, angle])
+
+            if not backend_mode:
+                cv2.imshow("Biomechanics Analysis", frame)
+
+                if cv2.waitKey(20) & 0xFF == ord('q'):
+                    break
+
+            frame_index += 1
+
+        cap.release()
+
+        if not backend_mode:
+            cv2.destroyAllWindows()
 
 
-# Velocity metrics
-valid_velocities = [v for v in angular_velocity if v is not None]
-max_velocity = max(valid_velocities) if valid_velocities else None
-min_velocity = min(valid_velocities) if valid_velocities else None
-
-if not BACKEND_MODE and valid_velocities:
-    print(f"Max extension speed: {max_velocity:.2f} deg/frame")
-    print(f"Max flexion speed: {min_velocity:.2f} deg/frame")
+        # -----------------------------
+        # DATA PROCESSING
+        # -----------------------------
+        angles = [row[1] for row in angle_data]
+        signal_quality = compute_signal_quality(angles)
+        smoothed_angles = moving_average(angles, window_size=5)
 
 
-# -----------------------------
-# REP COUNTING
-# -----------------------------
-transitions, reps = count_reps_bidirectional(smoothed_angles)
+        # -----------------------------
+        # ANGULAR VELOCITY
+        # -----------------------------
+        # Every smoothness/symmetry/control/efficiency threshold in this file
+        # (grade_smoothness, grade_control, compute_efficiency, ...) was
+        # tuned assuming a raw frame-to-frame angle difference at ~30fps.
+        # That raw difference is NOT actually deg/sec -- it's deg/frame, so
+        # a 60fps video shows half the per-frame change of a 30fps video of
+        # the identical real movement, and a 15fps video shows double, even
+        # though nothing about the movement itself differs. REFERENCE_FPS
+        # rescales every velocity to "as if this were a 30fps recording"
+        # before any grading happens, so the existing thresholds keep their
+        # original meaning at any frame rate. At exactly 30fps this
+        # multiplies by 1.0 -- a deliberate no-op that keeps every existing
+        # 30fps result (which is most phone recordings) byte-identical to
+        # before this change.
+        REFERENCE_FPS = 30.0
+        fps_scale = (fps / REFERENCE_FPS) if fps else 1.0
 
-if not BACKEND_MODE:
-    print("\n--- RESULTS ---")
-    print(f"Total frames: {len(angle_data)}")
-    print(f"State transitions: {transitions}")
-    print(f"Estimated reps: {reps}")
+        angular_velocity = []
 
-
-# -----------------------------
-# QUALITY METRICS (GLOBAL)
-# -----------------------------
-global_smoothness = compute_smoothness(angular_velocity)
-global_symmetry = compute_symmetry(angular_velocity)
-global_control = compute_control(angular_velocity)
-
-if not BACKEND_MODE:
-    print("\n--- QUALITY METRICS ---")
-    print(f"Smoothness: {global_smoothness:.3f}")
-    print(f"Symmetry: {global_symmetry:.3f}")
-    print(f"Control: {global_control:.3f}")
-
-
-# -----------------------------
-# PER-REP ANALYSIS
-# -----------------------------
-transition_indices = get_transition_indices(smoothed_angles)
-rep_segments = segment_reps(smoothed_angles, transition_indices)
-rep_results = analyze_reps(rep_segments, angular_velocity)
-fatigue_analysis = analyze_fatigue(rep_results)
-
-if not BACKEND_MODE:
-    print("\n--- PER-REP ANALYSIS ---")
-
-    for r in rep_results:
-        print(f"\nRep {r['rep']} (frames {r['start']} → {r['end']}):")
-
-        smooth_val = r["smoothness"]
-        sym_val = r["symmetry"]
-        ctrl_val = r["control"]
-
-        if smooth_val is not None:
-            print(
-                f"  Smoothness: {grade_smoothness(smooth_val)} ({smooth_val:.3f})")
-        else:
-            print("  Smoothness: N/A")
-
-        if sym_val is not None:
-            print(f"  Symmetry: {grade_symmetry(sym_val)} ({sym_val:.3f})")
-        else:
-            print("  Symmetry: N/A")
-
-        if ctrl_val is not None:
-            print(f"  Control: {grade_control(ctrl_val)} ({ctrl_val:.3f})")
-        else:
-            print("  Control: N/A")
-
-    print("\n--- FATIGUE ANALYSIS ---")
-    print(fatigue_analysis)
+        for i in range(len(smoothed_angles)):
+            if i == 0 or smoothed_angles[i] is None or smoothed_angles[i - 1] is None:
+                angular_velocity.append(None)
+            else:
+                angular_velocity.append(
+                    (smoothed_angles[i] - smoothed_angles[i - 1]) * fps_scale)
 
 
-# -----------------------------
-# SAVE CSV
-# -----------------------------
-with open(output_csv, "w", newline="") as f:
-    writer = csv.writer(f)
-    writer.writerow(
-        ["frame", "raw_angle", "smoothed_angle", "angular_velocity"])
+        # Velocity metrics
+        valid_velocities = [v for v in angular_velocity if v is not None]
+        max_velocity = max(valid_velocities) if valid_velocities else None
+        min_velocity = min(valid_velocities) if valid_velocities else None
 
-    for i in range(len(angle_data)):
-        writer.writerow([
-            i,
-            angles[i],
-            smoothed_angles[i],
-            angular_velocity[i]
-        ])
-
-if not BACKEND_MODE:
-    print(f"\nSaved data to {output_csv}")
+        if not backend_mode and valid_velocities:
+            print(f"Max extension speed: {max_velocity:.2f} deg/frame")
+            print(f"Max flexion speed: {min_velocity:.2f} deg/frame")
 
 
-# -----------------------------
-# PLOTS
-# -----------------------------
-plot_angles = [a if a is not None else np.nan for a in smoothed_angles]
-plot_velocity = [v if v is not None else np.nan for v in angular_velocity]
-
-if not BACKEND_MODE:
-    plt.figure(figsize=(12, 6))
-    plt.plot(plot_angles)
-    plt.axhline(y=70, linestyle="--")
-    plt.axhline(y=140, linestyle="--")
-    plt.title("Angle")
-    plt.grid()
-    plt.show()
-
-    plt.figure(figsize=(12, 4))
-    plt.plot(plot_velocity)
-    plt.axhline(y=0)
-    plt.title("Velocity")
-    plt.grid()
-    plt.show()
-
-
-# -----------------------------
-# FINAL JSON OUTPUT FOR SERVER
-# -----------------------------
-global_metrics_payload = {
-    "smoothness": safe_float(global_smoothness),
-    "symmetry": safe_float(global_symmetry),
-    "control": safe_float(global_control),
-    "efficiency": safe_float(compute_efficiency(
-        global_smoothness,
-        global_symmetry,
-        global_control
-    )),
-    "smoothness_grade": grade_smoothness(global_smoothness),
-    "symmetry_grade": grade_symmetry(global_symmetry),
-    "control_grade": grade_control(global_control),
-    "efficiency_grade": grade_efficiency(
-        compute_efficiency(
-            global_smoothness,
-            global_symmetry,
-            global_control
+        # -----------------------------
+        # REP COUNTING
+        # -----------------------------
+        transitions, reps = count_reps_bidirectional(
+            smoothed_angles,
+            low_thresh=resolved_flex_threshold,
+            high_thresh=resolved_extend_threshold,
         )
-    ),
-}
 
-result_data = {
-    "mode": MODE,
-    "daily_task": DAILY_TASK,
-    "daily_task_label": get_daily_task_label(DAILY_TASK),
-    "daily_task_focus": get_daily_task_focus(DAILY_TASK),
-    "video_path": video_path,
-    "output_csv": output_csv,
-    "total_frames": len(angle_data),
-    "signal_quality": signal_quality,
-    "reps": safe_float(reps),
-    "transitions": transitions,
-    "max_extension_speed": safe_float(max_velocity),
-    "max_flexion_speed": safe_float(min_velocity),
-    "fatigue_analysis": fatigue_analysis,
-    "global_metrics": global_metrics_payload,
-    "interpretation": interpret_results(MODE, global_metrics_payload, fatigue_analysis, DAILY_TASK),
-    "rep_analysis": []
-}
-
-for r in rep_results:
-    smooth_val = r["smoothness"]
-    sym_val = r["symmetry"]
-    ctrl_val = r["control"]
-
-    score = compute_rep_score(
-        r["smoothness"],
-        r["symmetry"],
-        r["control"]
-    )
-
-    result_data["rep_analysis"].append({
-        "rep": r["rep"],
-        "start": r["start"],
-        "end": r["end"],
-        "smoothness": safe_float(smooth_val),
-        "symmetry": safe_float(sym_val),
-        "control": safe_float(ctrl_val),
-        "smoothness_grade": grade_smoothness(smooth_val),
-        "symmetry_grade": grade_symmetry(sym_val),
-        "control_grade": grade_control(ctrl_val),
-        "score": score,
-        "score_grade": grade_score(score)
-    })
-
-    # -----------------------------
-# DEGRADATION DATA
-# -----------------------------
-rep_scores = [
-    r["score"] for r in result_data["rep_analysis"]
-    if r["score"] is not None
-]
-
-result_data["score_trend"] = rep_scores
-
-if len(rep_scores) >= 2:
-    result_data["performance_drop"] = rep_scores[0] - rep_scores[-1]
-else:
-    result_data["performance_drop"] = None
+        if not backend_mode:
+            print("\n--- RESULTS ---")
+            print(f"Total frames: {len(angle_data)}")
+            print(f"State transitions: {transitions}")
+            print(f"Estimated reps: {reps}")
 
 
-result_data["performance_summary"] = interpret_degradation(
-    result_data["performance_drop"]
-)
+        # -----------------------------
+        # QUALITY METRICS (GLOBAL)
+        # -----------------------------
+        global_smoothness = compute_smoothness(angular_velocity)
+        global_symmetry = compute_symmetry(angular_velocity)
+        global_control = compute_control(angular_velocity)
 
-movement_health_score = compute_movement_health_score(
-    result_data["global_metrics"],
-    result_data["performance_drop"]
-)
+        if not backend_mode:
+            print("\n--- QUALITY METRICS ---")
+            print(f"Smoothness: {global_smoothness:.3f}")
+            print(f"Symmetry: {global_symmetry:.3f}")
+            print(f"Control: {global_control:.3f}")
 
-result_data["movement_health_score"] = movement_health_score
-result_data["movement_health_grade"] = grade_movement_health(
-    movement_health_score
-)
 
-result_data["key_insights"] = build_key_insights(
-    result_data["global_metrics"],
-    result_data["rep_analysis"],
-    result_data["performance_summary"],
-    MODE
-)
+        # -----------------------------
+        # PER-REP ANALYSIS
+        # -----------------------------
+        transition_indices = get_transition_indices(
+            smoothed_angles,
+            low_thresh=resolved_flex_threshold,
+            high_thresh=resolved_extend_threshold,
+        )
+        rep_segments = segment_reps(smoothed_angles, transition_indices)
+        rep_results = analyze_reps(rep_segments, angular_velocity)
+        fatigue_analysis = analyze_fatigue(rep_results)
 
-result_data["movement_signature"] = classify_movement_signature(
-    result_data["global_metrics"],
-    result_data["performance_summary"],
-    MODE
-)
+        if not backend_mode:
+            print("\n--- PER-REP ANALYSIS ---")
 
-# -----------------------------
-# TASK-SPECIFIC ANALYSIS OUTPUT
-# -----------------------------
-result_data["task_analysis"] = None
+            for r in rep_results:
+                print(f"\nRep {r['rep']} (frames {r['start']} → {r['end']}):")
 
-if MODE == "daily" and DAILY_TASK == "sit_to_stand":
-    task_analysis: Dict[str, Any] = summarize_sit_to_stand_task(
-        task_signal_data,
-        len(angle_data),
-        fps
-    )
+                smooth_val = r["smoothness"]
+                sym_val = r["symmetry"]
+                ctrl_val = r["control"]
 
-    task_analysis["task_insights"] = build_sit_to_stand_insights(
-        task_analysis
-    )
+                if smooth_val is not None:
+                    print(
+                        f"  Smoothness: {grade_smoothness(smooth_val)} ({smooth_val:.3f})")
+                else:
+                    print("  Smoothness: N/A")
 
-    result_data["task_analysis"] = task_analysis
+                if sym_val is not None:
+                    print(f"  Symmetry: {grade_symmetry(sym_val)} ({sym_val:.3f})")
+                else:
+                    print("  Symmetry: N/A")
 
-elif MODE == "daily" and DAILY_TASK == "reach":
-    task_analysis: Dict[str, Any] = summarize_reach_task(
-        task_signal_data,
-        len(angle_data)
-    )
+                if ctrl_val is not None:
+                    print(f"  Control: {grade_control(ctrl_val)} ({ctrl_val:.3f})")
+                else:
+                    print("  Control: N/A")
 
-    task_analysis["task_insights"] = build_reach_insights(
-        task_analysis
-    )
+            print("\n--- FATIGUE ANALYSIS ---")
+            print(fatigue_analysis)
 
-    result_data["task_analysis"] = task_analysis
 
-elif MODE == "daily" and DAILY_TASK == "arm_raise":
-    task_analysis: Dict[str, Any] = summarize_arm_raise_task(
-        task_signal_data,
-        len(angle_data)
-    )
+        # -----------------------------
+        # SAVE CSV
+        # -----------------------------
+        with open(output_csv, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                ["frame", "raw_angle", "smoothed_angle", "angular_velocity"])
 
-    task_analysis["task_insights"] = build_arm_raise_insights(
-        task_analysis
-    )
+            for i in range(len(angle_data)):
+                writer.writerow([
+                    i,
+                    angles[i],
+                    smoothed_angles[i],
+                    angular_velocity[i]
+                ])
 
-    result_data["task_analysis"] = task_analysis
+        if not backend_mode:
+            print(f"\nSaved data to {output_csv}")
 
-elif MODE == "daily" and DAILY_TASK == "walking":
-    task_analysis: Dict[str, Any] = summarize_walking_task(
-        task_signal_data,
-        len(angle_data),
-        fps
-    )
 
-    task_analysis["task_insights"] = build_walking_insights(
-        task_analysis
-    )
+        # -----------------------------
+        # PLOTS
+        # -----------------------------
+        plot_angles = [a if a is not None else np.nan for a in smoothed_angles]
+        plot_velocity = [v if v is not None else np.nan for v in angular_velocity]
 
-    result_data["task_analysis"] = task_analysis
+        if not backend_mode:
+            import matplotlib.pyplot as plt
+            plt.figure(figsize=(12, 6))
+            plt.plot(plot_angles)
+            plt.axhline(y=70, linestyle="--")
+            plt.axhline(y=140, linestyle="--")
+            plt.title("Angle")
+            plt.grid()
+            plt.show()
 
-elif MODE == "daily" and DAILY_TASK == "balance":
-    task_analysis: Dict[str, Any] = summarize_balance_task(
-        task_signal_data,
-        len(angle_data)
-    )
+            plt.figure(figsize=(12, 4))
+            plt.plot(plot_velocity)
+            plt.axhline(y=0)
+            plt.title("Velocity")
+            plt.grid()
+            plt.show()
 
-    task_analysis["task_insights"] = build_balance_insights(
-        task_analysis
-    )
 
-    result_data["task_analysis"] = task_analysis
+        # -----------------------------
+        # FINAL JSON OUTPUT FOR SERVER
+        # -----------------------------
+        global_metrics_payload = {
+            "smoothness": safe_float(global_smoothness),
+            "symmetry": safe_float(global_symmetry),
+            "control": safe_float(global_control),
+            "efficiency": safe_float(compute_efficiency(
+                global_smoothness,
+                global_symmetry,
+                global_control
+            )),
+            "smoothness_grade": grade_smoothness(global_smoothness),
+            "symmetry_grade": grade_symmetry(global_symmetry),
+            "control_grade": grade_control(global_control),
+            "efficiency_grade": grade_efficiency(
+                compute_efficiency(
+                    global_smoothness,
+                    global_symmetry,
+                    global_control
+                )
+            ),
+        }
 
-elif MODE == "daily" and DAILY_TASK == "timed_up_and_go":
-    task_analysis: Dict[str, Any] = summarize_tug_task(
-        task_signal_data,
-        len(angle_data),
-        fps
-    )
+        # -----------------------------
+        # CALIBRATION DATA
+        # -----------------------------
+        # The raw observed range of this recording's elbow angle, exposed so
+        # a client-side calibration flow can propose flex/extend thresholds
+        # for THIS person (e.g. "a few degrees inside your own observed
+        # min/max") instead of the app silently assuming a fixed able-bodied
+        # range. Purely informational -- computing it never changes any
+        # analysis result above.
+        _valid_smoothed_angles = [a for a in smoothed_angles if a is not None]
+        calibration_data = {
+            "observed_min_angle": safe_float(
+                min(_valid_smoothed_angles)) if _valid_smoothed_angles else None,
+            "observed_max_angle": safe_float(
+                max(_valid_smoothed_angles)) if _valid_smoothed_angles else None,
+            "flex_threshold_used": safe_float(resolved_flex_threshold),
+            "extend_threshold_used": safe_float(resolved_extend_threshold),
+            "thresholds_calibrated": thresholds_calibrated,
+        }
 
-    task_analysis["task_insights"] = build_tug_insights(
-        task_analysis
-    )
+        result_data = {
+            "mode": mode,
+            "side": normalized_side,
+            "fps": fps,
+            "calibration_data": calibration_data,
+            "daily_task": daily_task,
+            "daily_task_label": get_daily_task_label(daily_task),
+            "daily_task_focus": get_daily_task_focus(daily_task),
+            "video_path": video_path,
+            "output_csv": output_csv,
+            "total_frames": len(angle_data),
+            "signal_quality": signal_quality,
+            "reps": safe_float(reps),
+            "transitions": transitions,
+            "max_extension_speed": safe_float(max_velocity),
+            "max_flexion_speed": safe_float(min_velocity),
+            "fatigue_analysis": fatigue_analysis,
+            "global_metrics": global_metrics_payload,
+            "interpretation": interpret_results(mode, global_metrics_payload, fatigue_analysis, daily_task),
+            "rep_analysis": []
+        }
 
-    result_data["task_analysis"] = task_analysis
+        for r in rep_results:
+            smooth_val = r["smoothness"]
+            sym_val = r["symmetry"]
+            ctrl_val = r["control"]
 
-# -----------------------------
-# BEST / WORST REP DETECTION
-# -----------------------------
-valid_reps = [
-    r for r in result_data["rep_analysis"]
-    if r["score"] is not None
-]
+            score = compute_rep_score(
+                r["smoothness"],
+                r["symmetry"],
+                r["control"]
+            )
 
-if valid_reps:
-    best_rep = max(valid_reps, key=lambda x: x["score"])
-    worst_rep = min(valid_reps, key=lambda x: x["score"])
+            result_data["rep_analysis"].append({
+                "rep": r["rep"],
+                "start": r["start"],
+                "end": r["end"],
+                "smoothness": safe_float(smooth_val),
+                "symmetry": safe_float(sym_val),
+                "control": safe_float(ctrl_val),
+                "smoothness_grade": grade_smoothness(smooth_val),
+                "symmetry_grade": grade_symmetry(sym_val),
+                "control_grade": grade_control(ctrl_val),
+                "score": score,
+                "score_grade": grade_score(score)
+            })
 
-    result_data["best_rep"] = best_rep
-    result_data["worst_rep"] = worst_rep
-else:
-    result_data["best_rep"] = None
-    result_data["worst_rep"] = None
+            # -----------------------------
+        # DEGRADATION DATA
+        # -----------------------------
+        rep_scores = [
+            r["score"] for r in result_data["rep_analysis"]
+            if r["score"] is not None
+        ]
 
-if BACKEND_MODE:
-    print(json.dumps(result_data))
+        result_data["score_trend"] = rep_scores
+
+        if len(rep_scores) >= 2:
+            result_data["performance_drop"] = rep_scores[0] - rep_scores[-1]
+        else:
+            result_data["performance_drop"] = None
+
+
+        result_data["performance_summary"] = interpret_degradation(
+            result_data["performance_drop"]
+        )
+
+        movement_health_score = compute_movement_health_score(
+            result_data["global_metrics"],
+            result_data["performance_drop"]
+        )
+
+        result_data["movement_health_score"] = movement_health_score
+        result_data["movement_health_grade"] = grade_movement_health(
+            movement_health_score
+        )
+
+        result_data["key_insights"] = build_key_insights(
+            result_data["global_metrics"],
+            result_data["rep_analysis"],
+            result_data["performance_summary"],
+            mode
+        )
+
+        result_data["movement_signature"] = classify_movement_signature(
+            result_data["global_metrics"],
+            result_data["performance_summary"],
+            mode
+        )
+
+        # -----------------------------
+        # TASK-SPECIFIC ANALYSIS OUTPUT
+        # -----------------------------
+        result_data["task_analysis"] = None
+
+        if mode == "daily" and daily_task == "sit_to_stand":
+            task_analysis: Dict[str, Any] = summarize_sit_to_stand_task(
+                task_signal_data,
+                len(angle_data),
+                fps
+            )
+
+            task_analysis["task_insights"] = build_sit_to_stand_insights(
+                task_analysis
+            )
+
+            result_data["task_analysis"] = task_analysis
+
+        elif mode == "daily" and daily_task == "reach":
+            task_analysis: Dict[str, Any] = summarize_reach_task(
+                task_signal_data,
+                len(angle_data)
+            )
+
+            task_analysis["task_insights"] = build_reach_insights(
+                task_analysis
+            )
+
+            result_data["task_analysis"] = task_analysis
+
+        elif mode == "daily" and daily_task == "arm_raise":
+            task_analysis: Dict[str, Any] = summarize_arm_raise_task(
+                task_signal_data,
+                len(angle_data)
+            )
+
+            task_analysis["task_insights"] = build_arm_raise_insights(
+                task_analysis
+            )
+
+            result_data["task_analysis"] = task_analysis
+
+        elif mode == "daily" and daily_task == "walking":
+            task_analysis: Dict[str, Any] = summarize_walking_task(
+                task_signal_data,
+                len(angle_data),
+                fps
+            )
+
+            task_analysis["task_insights"] = build_walking_insights(
+                task_analysis
+            )
+
+            result_data["task_analysis"] = task_analysis
+
+        elif mode == "daily" and daily_task == "balance":
+            task_analysis: Dict[str, Any] = summarize_balance_task(
+                task_signal_data,
+                len(angle_data)
+            )
+
+            task_analysis["task_insights"] = build_balance_insights(
+                task_analysis
+            )
+
+            result_data["task_analysis"] = task_analysis
+
+        elif mode == "daily" and daily_task == "timed_up_and_go":
+            task_analysis: Dict[str, Any] = summarize_tug_task(
+                task_signal_data,
+                len(angle_data),
+                fps
+            )
+
+            task_analysis["task_insights"] = build_tug_insights(
+                task_analysis
+            )
+
+            result_data["task_analysis"] = task_analysis
+
+        # -----------------------------
+        # BEST / WORST REP DETECTION
+        # -----------------------------
+        valid_reps = [
+            r for r in result_data["rep_analysis"]
+            if r["score"] is not None
+        ]
+
+        if valid_reps:
+            best_rep = max(valid_reps, key=lambda x: x["score"])
+            worst_rep = min(valid_reps, key=lambda x: x["score"])
+
+            result_data["best_rep"] = best_rep
+            result_data["worst_rep"] = worst_rep
+        else:
+            result_data["best_rep"] = None
+            result_data["worst_rep"] = None
+
+        return result_data
+    finally:
+        if cap is not None:
+            cap.release()
+        pose.close()
+
+
+if __name__ == "__main__":
+    BACKEND_MODE = os.getenv("BACKEND_MODE", "0") == "1"
+    video_path = os.getenv("VIDEO_PATH", "test_video.mp4")
+    output_csv = os.getenv("OUTPUT_CSV", "elbow_angles.csv")
+    MODE = os.getenv("MODE", "rep")
+    DAILY_TASK = os.getenv("DAILY_TASK", "reach")
+    SIDE = os.getenv("SIDE", "right")
+    # Optional calibration thresholds. Left unset (empty string) by default,
+    # which run_analysis() treats as None -> "use the built-in defaults" --
+    # matching this CLI's behavior before these existed.
+    FLEX_THRESHOLD = os.getenv("FLEX_THRESHOLD") or None
+    EXTEND_THRESHOLD = os.getenv("EXTEND_THRESHOLD") or None
+
+    try:
+        result_data = run_analysis(
+            video_path=video_path,
+            mode=MODE,
+            daily_task=DAILY_TASK,
+            output_csv=output_csv,
+            backend_mode=BACKEND_MODE,
+            side=SIDE,
+            flex_threshold=FLEX_THRESHOLD,
+            extend_threshold=EXTEND_THRESHOLD,
+        )
+    except RuntimeError as e:
+        if BACKEND_MODE:
+            print(json.dumps({"error": str(e)}))
+        else:
+            print(f"Error: {e}")
+        raise SystemExit(1)
+
+    if BACKEND_MODE:
+        print(json.dumps(result_data))

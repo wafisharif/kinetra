@@ -25,7 +25,12 @@ const LOCAL_API_BASE_URL = 'http://192.168.1.163:5000';
 // Example: const DEPLOYED_API_BASE_URL = 'https://your-app-name.onrender.com';
 const DEPLOYED_API_BASE_URL = 'https://unrest-busily-snort.ngrok-free.dev';
 
-const API_BASE_URL = DEPLOYED_API_BASE_URL || LOCAL_API_BASE_URL;
+// __DEV__ is a React Native global: true in a development build, false in a
+// production/release build. This used to be
+// `DEPLOYED_API_BASE_URL || LOCAL_API_BASE_URL`, which ALWAYS picked the
+// deployed URL -- a non-empty string is always truthy, so LOCAL_API_BASE_URL
+// could never actually be reached, even when developing locally.
+const API_BASE_URL = __DEV__ ? LOCAL_API_BASE_URL : DEPLOYED_API_BASE_URL;
 
 const ANALYSIS_TIMEOUT_MS = 90000;
 const SERVER_HEALTH_TIMEOUT_MS = 8000;
@@ -40,6 +45,15 @@ const APP_SAFETY_NOTE =
 
 type AnalysisResult = {
   mode: 'rep' | 'rehab' | 'lab' | 'daily';
+  side?: 'left' | 'right';
+  fps?: number;
+  calibration_data?: {
+    observed_min_angle: number | null;
+    observed_max_angle: number | null;
+    flex_threshold_used: number | null;
+    extend_threshold_used: number | null;
+    thresholds_calibrated: boolean;
+  };
   daily_task?: DailyTask;
   daily_task_label?: string;
   daily_task_focus?: {
@@ -5456,6 +5470,34 @@ export default function HomeScreen() {
   const [showServerDiagnostics, setShowServerDiagnostics] = useState(false);
   const [mode, setMode] = useState<'rep' | 'rehab' | 'lab' | 'daily'>('rep');
   const [dailyTask, setDailyTask] = useState<DailyTask>('reach');
+  // Phase 1: which arm the backend should track. Defaults to 'right', which
+  // is exactly the arm the backend always tracked before this selector
+  // existed -- so a user who never touches this gets identical behavior.
+  const [selectedSide, setSelectedSide] = useState<'left' | 'right'>('right');
+  // Phase 1: optional personalized rep-detection thresholds. null means
+  // "use the backend's built-in default range" (also identical to
+  // pre-Phase-1 behavior). Set once the user calibrates and confirms a
+  // suggestion below; cleared by "Reset to Default Range".
+  const [calibratedThresholds, setCalibratedThresholds] = useState<{
+    flex: number;
+    extend: number;
+  } | null>(null);
+  // True only for the one recording immediately after the user taps
+  // "Calibrate My Range" -- tells the result handler to turn that
+  // recording's observed angle range into a calibration suggestion instead
+  // of just showing normal results.
+  const [isCalibrating, setIsCalibrating] = useState(false);
+  const [pendingCalibrationSuggestion, setPendingCalibrationSuggestion] = useState<{
+    flex: number;
+    extend: number;
+    observedMin: number;
+    observedMax: number;
+  } | null>(null);
+  // Separate from analysisError on purpose: a calibration recording that
+  // didn't show enough range of motion is not an analysis failure -- the
+  // video analyzed fine and its result is still shown normally. This just
+  // explains why no calibration suggestion appeared.
+  const [calibrationMessage, setCalibrationMessage] = useState<string | null>(null);
   const [savedSessions, setSavedSessions] = useState<SavedSession[]>([]);
   const [comparisonSession, setComparisonSession] = useState<SavedSession | null>(null);
   const [showHistory, setShowHistory] = useState(false);
@@ -5995,6 +6037,7 @@ export default function HomeScreen() {
       setIsAnalyzing(true);
       setAnalysisError(null);
       setAnalysisResult(null);
+      setCalibrationMessage(null);
       setAnalysisStatusMessage('Checking analysis server...');
 
       const serverReady = await checkAnalysisServer();
@@ -6021,8 +6064,19 @@ export default function HomeScreen() {
 
       formData.append('mode', mode);
       formData.append('daily_task', dailyTask);
+      formData.append('side', selectedSide);
 
-      console.log('Selected daily task:', dailyTask);
+      // Only send calibration thresholds once the user has actually
+      // confirmed a calibration suggestion. Omitting these fields entirely
+      // when calibratedThresholds is null matches server.py's own default
+      // (None -> use the backend's built-in range), so a user who never
+      // calibrates gets byte-identical rep detection to before this existed.
+      if (calibratedThresholds) {
+        formData.append('flex_threshold', String(calibratedThresholds.flex));
+        formData.append('extend_threshold', String(calibratedThresholds.extend));
+      }
+
+      console.log('Selected daily task:', dailyTask, 'side:', selectedSide);
       console.log('Uploading to API:', `${API_BASE_URL}/analyze`);
 
       setAnalysisStatusMessage('Uploading video to analysis server...');
@@ -6030,9 +6084,11 @@ export default function HomeScreen() {
       const response = await fetch(`${API_BASE_URL}/analyze`, {
         method: 'POST',
         body: formData,
-        headers: {
-          'Content-Type': 'multipart/form-data',
-        },
+        // Deliberately no Content-Type header here. fetch/FormData sets it
+        // itself, including the multipart `boundary=...` that has to match
+        // how the body was actually encoded -- manually setting a bare
+        // 'multipart/form-data' (no boundary) is a known source of
+        // intermittent upload failures on React Native.
         signal: controller.signal,
       });
 
@@ -6057,6 +6113,38 @@ export default function HomeScreen() {
       }
 
       const typedResult = data as AnalysisResult;
+
+      // If the user tapped "Calibrate My Range" before this recording, turn
+      // the angle range we just observed into a suggested personalized
+      // rep-detection window instead of touching the result shown below.
+      // A 15% margin keeps the flex/extend boundaries safely inside the
+      // observed extremes (noise near the very top/bottom of a real range
+      // of motion shouldn't false-trigger a transition); a range narrower
+      // than 20 degrees is too little motion to calibrate from safely, so
+      // we silently skip the suggestion rather than lock in a degenerate
+      // window -- the user keeps the default range in that case.
+      if (isCalibrating) {
+        const cal = typedResult.calibration_data;
+        const min = cal?.observed_min_angle;
+        const max = cal?.observed_max_angle;
+
+        if (typeof min === 'number' && typeof max === 'number' && max - min >= 20) {
+          const margin = (max - min) * 0.15;
+          setPendingCalibrationSuggestion({
+            flex: Math.round((min + margin) * 10) / 10,
+            extend: Math.round((max - margin) * 10) / 10,
+            observedMin: Math.round(min * 10) / 10,
+            observedMax: Math.round(max * 10) / 10,
+          });
+          setCalibrationMessage(null);
+        } else {
+          setPendingCalibrationSuggestion(null);
+          setCalibrationMessage(
+            'Not enough movement range in that recording to calibrate. Move through your full comfortable range of motion and try again, or skip calibration.'
+          );
+        }
+        setIsCalibrating(false);
+      }
 
       const previousSession = findPreviousSessionForResult(typedResult);
       setComparisonSession(previousSession);
@@ -10739,6 +10827,109 @@ export default function HomeScreen() {
                 </Text>
               </Pressable>
             ))}
+          </View>
+
+          <View style={styles.dailyTaskBlock}>
+            <Text style={styles.dailyTaskTitle}>Which Arm Are You Testing?</Text>
+
+            <View style={styles.dailyTaskRow}>
+              {(['right', 'left'] as const).map((s) => (
+                <Pressable
+                  key={s}
+                  style={[
+                    styles.dailyTaskChip,
+                    selectedSide === s && styles.dailyTaskChipActive,
+                  ]}
+                  onPress={() => setSelectedSide(s)}
+                >
+                  <Text
+                    style={[
+                      styles.dailyTaskChipText,
+                      selectedSide === s && styles.dailyTaskChipTextActive,
+                    ]}
+                  >
+                    {s === 'right' ? 'Right Arm' : 'Left Arm'}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+
+            <Text style={styles.dailyTaskDescription}>
+              Kinetra tracks whichever arm you select here -- make sure that arm is the
+              one clearly visible to the camera during your recording.
+            </Text>
+
+            <View style={{ marginTop: 12 }}>
+              {calibratedThresholds ? (
+                <>
+                  <Text style={styles.dailyTaskDescription}>
+                    Personalized rep range active: flexed below {calibratedThresholds.flex}°,
+                    extended above {calibratedThresholds.extend}°.
+                  </Text>
+                  <Pressable
+                    style={[styles.dailyTaskChip, { marginTop: 8, flex: 0, alignSelf: 'flex-start', paddingHorizontal: 14 }]}
+                    onPress={() => {
+                      setCalibratedThresholds(null);
+                      setPendingCalibrationSuggestion(null);
+                      setCalibrationMessage(null);
+                    }}
+                  >
+                    <Text style={styles.dailyTaskChipText}>Reset to Default Range</Text>
+                  </Pressable>
+                </>
+              ) : pendingCalibrationSuggestion ? (
+                <View style={styles.quickStartBox}>
+                  <Text style={styles.quickStartTitle}>Calibration Recording Complete</Text>
+                  <Text style={styles.quickStartText}>
+                    We measured your range as {pendingCalibrationSuggestion.observedMin}° to{' '}
+                    {pendingCalibrationSuggestion.observedMax}°. Suggested personalized
+                    thresholds: flexed below {pendingCalibrationSuggestion.flex}°, extended
+                    above {pendingCalibrationSuggestion.extend}°.
+                  </Text>
+                  <View style={[styles.dailyTaskRow, { marginTop: 10, marginBottom: 0 }]}>
+                    <Pressable
+                      style={styles.dailyTaskChip}
+                      onPress={() => {
+                        setCalibratedThresholds({
+                          flex: pendingCalibrationSuggestion.flex,
+                          extend: pendingCalibrationSuggestion.extend,
+                        });
+                        setPendingCalibrationSuggestion(null);
+                      }}
+                    >
+                      <Text style={styles.dailyTaskChipText}>Use These</Text>
+                    </Pressable>
+                    <Pressable
+                      style={styles.dailyTaskChip}
+                      onPress={() => setPendingCalibrationSuggestion(null)}
+                    >
+                      <Text style={styles.dailyTaskChipText}>Keep Default</Text>
+                    </Pressable>
+                  </View>
+                </View>
+              ) : (
+                <>
+                  <Pressable
+                    style={[styles.dailyTaskChip, { flex: 0, alignSelf: 'flex-start', paddingHorizontal: 14 }]}
+                    onPress={() => {
+                      setIsCalibrating(true);
+                      setCalibrationMessage(
+                        'Calibration mode is on. Record one more take, moving through your full comfortable range of motion.'
+                      );
+                    }}
+                  >
+                    <Text style={styles.dailyTaskChipText}>
+                      {isCalibrating ? 'Calibrating: Record Your Next Take' : 'Calibrate My Range'}
+                    </Text>
+                  </Pressable>
+                  {calibrationMessage ? (
+                    <Text style={[styles.dailyTaskDescription, { marginTop: 8 }]}>
+                      {calibrationMessage}
+                    </Text>
+                  ) : null}
+                </>
+              )}
+            </View>
           </View>
 
           {mode === 'daily' ? (
