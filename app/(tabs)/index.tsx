@@ -1,12 +1,14 @@
 import { useOnDevicePose } from '@/hooks/useOnDevicePose';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { CameraView, useCameraPermissions } from 'expo-camera';
+import * as Notifications from 'expo-notifications';
 import { useVideoPlayer, VideoView } from 'expo-video';
 import { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
   BackHandler,
+  Platform,
   Pressable,
   ScrollView,
   Share,
@@ -16,6 +18,21 @@ import {
   View,
 } from 'react-native';
 import Svg, { Circle, Line } from 'react-native-svg';
+
+// Local (on-device, no server) daily reminder notification. Foreground
+// behavior only matters if the app happens to be open when the reminder
+// fires -- still show it as a banner/list entry so it's not silently
+// swallowed, matching what a user would expect from any reminder app.
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowBanner: true,
+    shouldShowList: true,
+    shouldPlaySound: false,
+    shouldSetBadge: false,
+  }),
+});
+
+const REMINDER_NOTIFICATION_IDENTIFIER = 'kinetra-daily-reminder';
 const LOCAL_API_BASE_URL = 'http://192.168.1.163:5000';
 
 // ⚠️  This is an ngrok free-tier URL and WILL EXPIRE. For production
@@ -1881,6 +1898,156 @@ function getTeamRoster(sessions: SavedSession[]) {
       };
     })
     .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// --- Consistency streak + badges (Phase 4: startup-shaped, honest gamification) ---
+//
+// Design intent: reward showing up, not gaming a score. A streak counts a
+// calendar day as "done" the moment ANY session is saved that day -- one
+// quick daily check and a full workout both count equally, so there's no
+// incentive to over-record. Badges are similarly all effort/consistency
+// based (never score-based), so nobody is rewarded for gaming a high score
+// or penalized for a low one -- that would directly undercut the app's own
+// honesty-first design elsewhere (Transparency screen, calibration, etc).
+
+function getLocalDateKey(timestamp: string) {
+  const date = new Date(timestamp);
+  // Local calendar day, not UTC -- a session at 11pm and one at 1am the
+  // "same night" should usually count as two different days for a streak,
+  // matching how a person actually experiences "did I check in today".
+  return `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
+}
+
+function getConsistencyStreaks(sessions: SavedSession[]) {
+  if (sessions.length === 0) {
+    return { currentStreak: 0, longestStreak: 0, activeToday: false };
+  }
+
+  const uniqueDayKeys = [...new Set(sessions.map((s) => getLocalDateKey(s.timestamp)))];
+  const dayTimestamps = uniqueDayKeys
+    .map((key) => {
+      const [year, month, day] = key.split('-').map(Number);
+      return new Date(year, month, day).getTime();
+    })
+    .sort((a, b) => b - a); // newest first
+
+  const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+  const todayKey = getLocalDateKey(new Date().toISOString());
+  const activeToday = uniqueDayKeys.includes(todayKey);
+
+  // Current streak: walk backward from today (or yesterday, if today has no
+  // check-in yet but yesterday's streak is still "alive" until today ends).
+  let currentStreak = 0;
+  const startTime = dayTimestamps[0];
+  const mostRecentGapDays = Math.round((new Date().setHours(0, 0, 0, 0) - startTime) / ONE_DAY_MS);
+
+  if (mostRecentGapDays <= 1) {
+    currentStreak = 1;
+    for (let i = 1; i < dayTimestamps.length; i += 1) {
+      const gap = Math.round((dayTimestamps[i - 1] - dayTimestamps[i]) / ONE_DAY_MS);
+      if (gap === 1) {
+        currentStreak += 1;
+      } else {
+        break;
+      }
+    }
+  }
+
+  // Longest streak ever, across all history.
+  let longestStreak = 1;
+  let running = 1;
+  for (let i = 1; i < dayTimestamps.length; i += 1) {
+    const gap = Math.round((dayTimestamps[i - 1] - dayTimestamps[i]) / ONE_DAY_MS);
+    if (gap === 1) {
+      running += 1;
+    } else {
+      longestStreak = Math.max(longestStreak, running);
+      running = 1;
+    }
+  }
+  longestStreak = Math.max(longestStreak, running);
+
+  return { currentStreak, longestStreak, activeToday };
+}
+
+type Badge = {
+  id: string;
+  label: string;
+  description: string;
+  earned: boolean;
+};
+
+function getEarnedBadges(
+  sessions: SavedSession[],
+  hasAnyCalibration: boolean
+): Badge[] {
+  const { longestStreak } = getConsistencyStreaks(sessions);
+  const dailyTasks: DailyTask[] = [
+    'reach',
+    'arm_raise',
+    'sit_to_stand',
+    'walking',
+    'balance',
+    'timed_up_and_go',
+  ];
+  const completedTaskCount = dailyTasks.filter(
+    (task) => getSavedSessionsForTask(sessions, task).length > 0
+  ).length;
+  const hasLeftSide = sessions.some((s) => s.side === 'left');
+  const hasRightSide = sessions.some((s) => s.side === 'right' || !s.side);
+  const rehabCount = getSavedRehabSessions(sessions).length;
+  const hasTeamScreening = sessions.some((s) => !!s.athlete_name);
+
+  return [
+    {
+      id: 'first_checkin',
+      label: 'First Check-In',
+      description: 'Saved your first movement check.',
+      earned: sessions.length >= 1,
+    },
+    {
+      id: 'streak_3',
+      label: '3-Day Streak',
+      description: 'Checked in three days in a row.',
+      earned: longestStreak >= 3,
+    },
+    {
+      id: 'streak_7',
+      label: '7-Day Streak',
+      description: 'Checked in seven days in a row.',
+      earned: longestStreak >= 7,
+    },
+    {
+      id: 'calibrated',
+      label: 'Personalized',
+      description: 'Calibrated rep detection to your own range of motion.',
+      earned: hasAnyCalibration,
+    },
+    {
+      id: 'both_sides',
+      label: 'Both Sides Tested',
+      description: 'Recorded a check for both your left and right side.',
+      earned: hasLeftSide && hasRightSide,
+    },
+    {
+      id: 'full_battery',
+      label: 'Full Battery',
+      description: 'Tried all six daily movement checks at least once.',
+      earned: completedTaskCount >= dailyTasks.length,
+    },
+    {
+      id: 'rehab_consistency',
+      label: 'Rehab Regular',
+      description: 'Logged five or more rehab consistency checks.',
+      earned: rehabCount >= 5,
+    },
+    {
+      id: 'team_screener',
+      label: 'Team Screener',
+      description: 'Used Team Screening to check in at least one athlete.',
+      earned: hasTeamScreening,
+    },
+  ];
 }
 
 function getLatestRehabSession(sessions: SavedSession[]) {
@@ -5588,6 +5755,29 @@ export default function HomeScreen() {
   const [showBuilderTools, setShowBuilderTools] = useState(false);
   const [showReportExport, setShowReportExport] = useState(false);
   const [showAiCoach, setShowAiCoach] = useState(false);
+  // Phase 4 (startup pivot): a REAL LLM-generated note, layered onto the
+  // existing (rule-based) AI Coach screen. This is intentionally separate
+  // from `coach` (getMovementCoachPlan) above -- that stays fast, free, and
+  // fully offline; this is an optional, explicit, one-tap request that
+  // calls a Claude API proxy on our own backend (never the model directly
+  // from the phone -- see server.py's /ai-coach route for why). Only
+  // numeric scores/grades for the latest session are ever sent -- never
+  // video, never raw pose data.
+  const [llmCoachNote, setLlmCoachNote] = useState<string | null>(null);
+  const [llmCoachLoading, setLlmCoachLoading] = useState(false);
+  const [llmCoachError, setLlmCoachError] = useState<string | null>(null);
+  const [llmCoachUnavailableReason, setLlmCoachUnavailableReason] = useState<string | null>(null);
+  // Local, on-device daily reminder (no server, no push service -- just the
+  // OS's own notification scheduler). `reminderHour` is in 24-hour local
+  // time. Persisted so the schedule survives an app restart; re-scheduled
+  // from scratch on load (Android/iOS clear scheduled local notifications
+  // are NOT guaranteed to survive things like an app update, so treating
+  // AsyncStorage as the source of truth and re-registering is more robust
+  // than trusting the OS to have kept it).
+  const [reminderEnabled, setReminderEnabled] = useState(false);
+  const [reminderHour, setReminderHour] = useState(18);
+  const [reminderStatusMessage, setReminderStatusMessage] = useState<string | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
   const [showWeeklyReport, setShowWeeklyReport] = useState(false);
   const [showYoloFramework, setShowYoloFramework] = useState(false);
   const [showMobilityProfile, setShowMobilityProfile] = useState(false);
@@ -5675,6 +5865,123 @@ export default function HomeScreen() {
     }
   };
 
+  const loadReminderSettings = async () => {
+    try {
+      const raw = await AsyncStorage.getItem('reminder_settings_v1');
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      const hour = typeof parsed?.hour === 'number' && parsed.hour >= 0 && parsed.hour <= 23
+        ? parsed.hour
+        : 18;
+      setReminderHour(hour);
+
+      if (parsed?.enabled) {
+        // Re-registering on every app start (rather than trusting the OS to
+        // have kept a previous schedule) is deliberate -- see the comment
+        // on the state declaration above.
+        const granted = await ensureNotificationPermission();
+        if (granted) {
+          await scheduleReminderNotification(hour);
+          setReminderEnabled(true);
+        } else {
+          // Permission was revoked since it was last enabled (e.g. in OS
+          // settings) -- reflect that honestly instead of claiming it's on.
+          setReminderEnabled(false);
+        }
+      }
+    } catch (error) {
+      console.log('Failed to load reminder settings:', error);
+    }
+  };
+
+  const ensureNotificationPermission = async (): Promise<boolean> => {
+    if (Platform.OS === 'web') {
+      // expo-notifications does not support scheduled local notifications
+      // on web -- this app's web export exists for development/testing,
+      // not as a real target platform, so fail closed with a clear reason
+      // rather than silently pretending it worked.
+      setReminderStatusMessage('Reminders are not supported in the web preview -- try this on a real phone.');
+      return false;
+    }
+
+    try {
+      const existing = await Notifications.getPermissionsAsync();
+      if (existing.granted) return true;
+
+      const requested = await Notifications.requestPermissionsAsync();
+      if (requested.granted) return true;
+
+      setReminderStatusMessage(
+        'Notification permission was not granted. Enable notifications for Kinetra in your phone settings, then try again.'
+      );
+      return false;
+    } catch (error) {
+      console.log('Failed to request notification permission:', error);
+      setReminderStatusMessage('Could not request notification permission on this device.');
+      return false;
+    }
+  };
+
+  const scheduleReminderNotification = async (hour: number) => {
+    try {
+      await Notifications.cancelScheduledNotificationAsync(REMINDER_NOTIFICATION_IDENTIFIER).catch(() => {});
+
+      await Notifications.scheduleNotificationAsync({
+        identifier: REMINDER_NOTIFICATION_IDENTIFIER,
+        content: {
+          title: 'Movement check-in',
+          body: 'Keep your streak going -- record a quick Kinetra check today.',
+        },
+        trigger: {
+          type: Notifications.SchedulableTriggerInputTypes.DAILY,
+          hour,
+          minute: 0,
+        },
+      });
+    } catch (error) {
+      console.log('Failed to schedule reminder notification:', error);
+      throw error;
+    }
+  };
+
+  const setReminderPreference = async (enabled: boolean, hour: number) => {
+    setReminderStatusMessage(null);
+
+    if (!enabled) {
+      setReminderEnabled(false);
+      try {
+        await Notifications.cancelScheduledNotificationAsync(REMINDER_NOTIFICATION_IDENTIFIER).catch(() => {});
+        await AsyncStorage.setItem(
+          'reminder_settings_v1',
+          JSON.stringify({ enabled: false, hour })
+        );
+      } catch (error) {
+        console.log('Failed to disable reminder:', error);
+      }
+      return;
+    }
+
+    const granted = await ensureNotificationPermission();
+    if (!granted) {
+      setReminderEnabled(false);
+      return;
+    }
+
+    try {
+      await scheduleReminderNotification(hour);
+      setReminderEnabled(true);
+      setReminderHour(hour);
+      await AsyncStorage.setItem(
+        'reminder_settings_v1',
+        JSON.stringify({ enabled: true, hour })
+      );
+    } catch (error) {
+      console.log('Failed to enable reminder:', error);
+      setReminderStatusMessage('Could not schedule the reminder on this device. Try again.');
+      setReminderEnabled(false);
+    }
+  };
+
   const findPreviousSessionForResult = (result: AnalysisResult) => {
     return savedSessions.find((session) => {
       if (session.mode !== result.mode) return false;
@@ -5726,6 +6033,13 @@ export default function HomeScreen() {
         'movement_sessions_v1',
         JSON.stringify(updatedSessions)
       );
+
+      // A new session just became "the latest" -- clear any AI Coach note
+      // from a previous session so it can't be mistaken for feedback on
+      // this new result.
+      setLlmCoachNote(null);
+      setLlmCoachError(null);
+      setLlmCoachUnavailableReason(null);
     } catch (error) {
       console.log('Failed to save session:', error);
     }
@@ -5975,6 +6289,87 @@ export default function HomeScreen() {
     }
   };
 
+  const requestLlmCoachNote = async () => {
+    const latest = savedSessions[0] || null;
+
+    if (!latest) {
+      setLlmCoachError('Record and save at least one check first, then ask again.');
+      return;
+    }
+
+    setLlmCoachLoading(true);
+    setLlmCoachError(null);
+    setLlmCoachUnavailableReason(null);
+    setLlmCoachNote(null);
+
+    const taskLabel =
+      latest.daily_task_label ||
+      (latest.daily_task ? getDailyTaskLabel(latest.daily_task) : null) ||
+      (latest.mode === 'rehab' ? 'Rehab Consistency Check' : 'Movement Check');
+
+    const recentScores = (
+      latest.daily_task
+        ? getSavedSessionsForTask(savedSessions, latest.daily_task)
+        : latest.mode === 'rehab'
+          ? getSavedRehabSessions(savedSessions)
+          : [latest]
+    )
+      .slice(0, 6)
+      .map((session) => session.primary_score)
+      .filter((score): score is number => typeof score === 'number')
+      .reverse(); // oldest -> newest, matching the backend prompt's expectation
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 25000);
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/ai-coach`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          task_label: taskLabel,
+          mode: latest.mode,
+          primary_score: latest.primary_score,
+          primary_grade: latest.primary_grade,
+          confidence_grade: latest.confidence_grade,
+          side: latest.side,
+          thresholds_calibrated: latest.thresholds_calibrated,
+          recent_scores: recentScores,
+        }),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeoutId);
+
+      const body = await response.json().catch(() => null);
+
+      if (response.status === 503) {
+        setLlmCoachUnavailableReason(
+          "The app's owner hasn't turned AI Coach on for this server yet -- it needs an API key configured on the backend. Everything else in the app still works normally."
+        );
+        return;
+      }
+
+      if (!response.ok || !body?.feedback) {
+        setLlmCoachError(
+          body?.details || 'AI Coach could not respond right now. Try again in a moment.'
+        );
+        return;
+      }
+
+      setLlmCoachNote(body.feedback);
+    } catch (error: any) {
+      clearTimeout(timeoutId);
+      setLlmCoachError(
+        error?.name === 'AbortError'
+          ? 'AI Coach took too long to respond. Try again shortly.'
+          : `Could not reach the AI Coach service at ${API_BASE_URL}.`
+      );
+    } finally {
+      setLlmCoachLoading(false);
+    }
+  };
+
   const loadOnboardingStatus = async () => {
     try {
       const hasSeenOnboarding = await AsyncStorage.getItem('has_seen_onboarding_v1');
@@ -6004,6 +6399,7 @@ export default function HomeScreen() {
     loadGuidedTestProgress();
     loadOnboardingStatus();
     loadCalibration();
+    loadReminderSettings();
   }, [requestPermission]);
 
   // ----- On-device pose snapshot loop (Step 1) -----------------------------
@@ -6896,6 +7292,150 @@ export default function HomeScreen() {
         <Pressable
           style={styles.mainButton}
           onPress={() => setShowTransparency(false)}
+        >
+          <Text style={styles.buttonText}>Back Home</Text>
+        </Pressable>
+      </ScrollView>
+    );
+  }
+
+  if (showSettings) {
+    const reminderHourOptions = [
+      { hour: 8, label: '8:00 AM' },
+      { hour: 12, label: '12:00 PM' },
+      { hour: 18, label: '6:00 PM' },
+      { hour: 20, label: '8:00 PM' },
+    ];
+
+    return (
+      <ScrollView
+        style={styles.homeScroll}
+        contentContainerStyle={styles.cameraSetupContent}
+        showsVerticalScrollIndicator={false}
+      >
+        <View style={styles.heroBadge}>
+          <Text style={styles.heroBadgeText}>Settings</Text>
+        </View>
+
+        <Text style={styles.title}>Settings</Text>
+
+        <Text style={styles.subtitle}>
+          Everything that changes how Kinetra behaves for you, in one place.
+        </Text>
+
+        <View style={styles.cameraSetupCard}>
+          <Text style={styles.sectionTitle}>Daily Reminder</Text>
+          <Text style={styles.dailyTaskDescription}>
+            A local notification from your phone -- not from a server, and not tied to any
+            account. Nothing is sent anywhere to schedule this.
+          </Text>
+
+          <Pressable
+            style={[
+              styles.dailyTaskChip,
+              { marginTop: 10, flex: 0, alignSelf: 'flex-start', paddingHorizontal: 14 },
+              reminderEnabled && styles.dailyTaskChipActive,
+            ]}
+            onPress={() => setReminderPreference(!reminderEnabled, reminderHour)}
+            accessibilityRole="switch"
+            accessibilityState={{ checked: reminderEnabled }}
+            accessibilityLabel="Daily reminder notification"
+          >
+            <Text
+              style={[
+                styles.dailyTaskChipText,
+                reminderEnabled && styles.dailyTaskChipTextActive,
+              ]}
+            >
+              {reminderEnabled ? 'Daily Reminder: On' : 'Daily Reminder: Off'}
+            </Text>
+          </Pressable>
+
+          {reminderEnabled ? (
+            <View style={{ marginTop: 14 }}>
+              <Text style={styles.inputLabel}>Remind Me At</Text>
+              <View style={styles.dailyTaskRow}>
+                {reminderHourOptions.map((option) => (
+                  <Pressable
+                    key={option.hour}
+                    style={[
+                      styles.dailyTaskChip,
+                      reminderHour === option.hour && styles.dailyTaskChipActive,
+                    ]}
+                    onPress={() => setReminderPreference(true, option.hour)}
+                    accessibilityRole="radio"
+                    accessibilityState={{ checked: reminderHour === option.hour }}
+                    accessibilityLabel={`Remind me at ${option.label}`}
+                  >
+                    <Text
+                      style={[
+                        styles.dailyTaskChipText,
+                        reminderHour === option.hour && styles.dailyTaskChipTextActive,
+                      ]}
+                    >
+                      {option.label}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+            </View>
+          ) : null}
+
+          {reminderStatusMessage ? (
+            <View style={[styles.cameraMistakeCard, { marginTop: 12 }]}>
+              <Text style={styles.cameraMistakeText}>{reminderStatusMessage}</Text>
+            </View>
+          ) : null}
+        </View>
+
+        <View style={styles.cameraSetupCard}>
+          <Text style={styles.sectionTitle}>Calibration</Text>
+          <Text style={styles.dailyTaskDescription}>
+            Right arm: {calibratedThresholdsBySide.right ? 'personalized' : 'using default range'}.
+            {'\n'}Left arm: {calibratedThresholdsBySide.left ? 'personalized' : 'using default range'}.
+          </Text>
+
+          {calibratedThresholdsBySide.left || calibratedThresholdsBySide.right ? (
+            <Pressable
+              style={[styles.secondaryButton, { marginTop: 10 }]}
+              onPress={() => {
+                persistCalibrationForSide('left', null);
+                persistCalibrationForSide('right', null);
+              }}
+            >
+              <Text style={styles.secondaryButtonText}>Reset Both to Default Range</Text>
+            </Pressable>
+          ) : null}
+        </View>
+
+        <View style={styles.cameraSetupCard}>
+          <Text style={styles.sectionTitle}>Privacy & Data</Text>
+          <Text style={styles.dailyTaskDescription}>
+            What Kinetra measures, its known limitations, and exactly what happens to your
+            data and video.
+          </Text>
+          <Pressable
+            style={[styles.secondaryButton, { marginTop: 10 }]}
+            onPress={() => {
+              setShowSettings(false);
+              setShowTransparency(true);
+            }}
+          >
+            <Text style={styles.secondaryButtonText}>Open Transparency Page</Text>
+          </Pressable>
+        </View>
+
+        <View style={styles.cameraSetupCard}>
+          <Text style={styles.sectionTitle}>About</Text>
+          <Text style={styles.dailyTaskDescription}>
+            {APP_NAME} {APP_BETA_LABEL} -- version 0.1.0{'\n'}
+            Analysis server: {API_BASE_URL}
+          </Text>
+        </View>
+
+        <Pressable
+          style={styles.mainButton}
+          onPress={() => setShowSettings(false)}
         >
           <Text style={styles.buttonText}>Back Home</Text>
         </Pressable>
@@ -9101,10 +9641,60 @@ export default function HomeScreen() {
           ))}
         </View>
 
+        <View style={styles.aiCoachCard}>
+          <Text style={styles.sectionTitle}>Ask Claude for a Personal Note</Text>
+          <Text style={styles.dailyTaskDescription}>
+            Everything above is generated by this app&apos;s own rules, entirely on your
+            phone. This is different: it sends only your latest score, grade, and recent
+            trend for that task (never video, never raw pose data) to Claude, Anthropic&apos;s
+            AI model, to write one short, personal note about it.
+          </Text>
+
+          <Pressable
+            style={[styles.mainButton, { marginTop: 12 }, llmCoachLoading && styles.disabledButton]}
+            onPress={requestLlmCoachNote}
+            disabled={llmCoachLoading}
+            accessibilityRole="button"
+            accessibilityLabel="Ask Claude about my latest result"
+            accessibilityState={{ disabled: llmCoachLoading, busy: llmCoachLoading }}
+          >
+            {llmCoachLoading ? (
+              <View style={styles.analyzingRow}>
+                <ActivityIndicator size="small" color="#ffffff" />
+                <Text style={styles.buttonText}>Asking Claude...</Text>
+              </View>
+            ) : (
+              <Text style={styles.buttonText}>
+                {llmCoachNote ? 'Ask Again' : 'Ask Claude About My Latest Result'}
+              </Text>
+            )}
+          </Pressable>
+
+          {llmCoachNote ? (
+            <View style={[styles.cameraSetupHeroCard, { marginTop: 12 }]}>
+              <Text style={styles.metricLabelSmall}>Claude&apos;s Note</Text>
+              <Text style={styles.metricValueLarge}>{llmCoachNote}</Text>
+            </View>
+          ) : null}
+
+          {llmCoachUnavailableReason ? (
+            <View style={[styles.cameraSetupCard, { marginTop: 12 }]}>
+              <Text style={styles.sectionTitle}>Not Turned On Yet</Text>
+              <Text style={styles.cameraMistakeText}>{llmCoachUnavailableReason}</Text>
+            </View>
+          ) : null}
+
+          {llmCoachError ? (
+            <View style={[styles.errorCard, { marginTop: 12 }]}>
+              <Text style={styles.errorText}>{llmCoachError}</Text>
+            </View>
+          ) : null}
+        </View>
+
         <View style={styles.aiCoachDisclaimerCard}>
           <Text style={styles.aiCoachDisclaimerTitle}>Important</Text>
           <Text style={styles.aiCoachDisclaimerText}>
-            This coach is for movement awareness and tracking only. It does not diagnose, treat, or replace medical advice.
+            This coach is for movement awareness and tracking only. It does not diagnose, treat, or replace medical advice. Claude&apos;s note above is AI-generated commentary on your scores, not a clinical opinion.
           </Text>
         </View>
 
@@ -10955,6 +11545,15 @@ export default function HomeScreen() {
             </Pressable>
 
             <Pressable
+              style={styles.howItWorksButton}
+              onPress={() => setShowSettings(true)}
+              accessibilityRole="button"
+              accessibilityLabel="Settings"
+            >
+              <Text style={styles.howItWorksButtonText}>Settings</Text>
+            </Pressable>
+
+            <Pressable
               style={styles.dailyHealthTopButton}
               onPress={() => setShowDailyHealthOverview(true)}
             >
@@ -11278,6 +11877,67 @@ export default function HomeScreen() {
           </View>
 
           <View style={styles.dailyTaskBlock}>
+            <Text style={styles.dailyTaskTitle}>Consistency Streak</Text>
+
+            {(() => {
+              const streaks = getConsistencyStreaks(savedSessions);
+              const hasAnyCalibration =
+                !!calibratedThresholdsBySide.left || !!calibratedThresholdsBySide.right;
+              const badges = getEarnedBadges(savedSessions, hasAnyCalibration);
+              const earnedBadges = badges.filter((b) => b.earned);
+
+              return (
+                <>
+                  <Text style={styles.dailyTaskDescription}>
+                    {streaks.currentStreak > 0
+                      ? `${streaks.currentStreak} day${streaks.currentStreak === 1 ? '' : 's'} in a row${streaks.activeToday ? ' -- checked in today' : ' -- check in today to keep it going'}.`
+                      : savedSessions.length > 0
+                        ? "Your streak reset. Check in today to start a new one."
+                        : 'Save your first check to start a streak.'}
+                    {streaks.longestStreak > streaks.currentStreak
+                      ? ` Longest streak so far: ${streaks.longestStreak} days.`
+                      : ''}
+                  </Text>
+
+                  <View style={styles.setupChipWrap}>
+                    {badges.map((badge) => (
+                      <View
+                        key={badge.id}
+                        style={[
+                          styles.setupChip,
+                          !badge.earned && {
+                            backgroundColor: 'rgba(100, 116, 139, 0.12)',
+                            borderColor: 'rgba(100, 116, 139, 0.28)',
+                          },
+                        ]}
+                      >
+                        <Text
+                          style={[
+                            styles.setupChipText,
+                            // #94a3b8 (not the dimmer #64748b) -- checked
+                            // against WCAG AA contrast requirements, see
+                            // ACCESSIBILITY_NOTES.md. Also reuses a color
+                            // already used elsewhere in the app instead of
+                            // introducing a new one.
+                            !badge.earned && { color: '#94a3b8' },
+                          ]}
+                        >
+                          {badge.earned ? '✓ ' : ''}{badge.label}
+                        </Text>
+                      </View>
+                    ))}
+                  </View>
+
+                  <Text style={[styles.historyEmptyText, { marginTop: 8 }]}>
+                    {earnedBadges.length}/{badges.length} badges earned -- all based on
+                    showing up and using the app fully, never on getting a high score.
+                  </Text>
+                </>
+              );
+            })()}
+          </View>
+
+          <View style={styles.dailyTaskBlock}>
             <Text style={styles.dailyTaskTitle}>Team Screening</Text>
 
             <Text style={styles.dailyTaskDescription}>
@@ -11293,6 +11953,10 @@ export default function HomeScreen() {
                 teamModeEnabled && styles.dailyTaskChipActive,
               ]}
               onPress={() => setTeamModeEnabled(!teamModeEnabled)}
+              accessibilityRole="switch"
+              accessibilityState={{ checked: teamModeEnabled }}
+              accessibilityLabel="Team Screening"
+              accessibilityHint="Tags each saved recording with an athlete name for later review"
             >
               <Text
                 style={[
@@ -11311,6 +11975,7 @@ export default function HomeScreen() {
                   style={styles.feedbackInput}
                   value={athleteNameInput}
                   onChangeText={setAthleteNameInput}
+                  accessibilityLabel="Athlete name for this recording"
                   placeholder="Example: Jordan, #14, Alex R."
                   placeholderTextColor="#64748b"
                 />

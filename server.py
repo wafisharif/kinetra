@@ -6,6 +6,8 @@ import uuid
 from collections import defaultdict, deque
 from pathlib import Path
 
+import requests
+
 from pose_test import run_analysis
 
 app = Flask(__name__)
@@ -208,6 +210,227 @@ def analyze():
                 filepath.unlink()
         except Exception as cleanup_error:
             print(f"Cleanup failed for {filepath}: {cleanup_error}")
+
+
+# ---------------------------------------------------------------------------
+# AI Coach — server-side Claude proxy.
+#
+# Design choice, deliberate: the API key lives ONLY here, as an environment
+# variable on this server, never in the mobile app. The app never talks to
+# Anthropic directly. That means:
+#   1. The key can never leak by someone decompiling the app or sniffing its
+#      network traffic.
+#   2. This is the one place cost, rate limits, and what data leaves the
+#      device are actually enforced.
+#
+# Data-minimization, also deliberate: this endpoint accepts ONLY numeric
+# scores, letter grades, task names, and small trend arrays of past scores
+# for the same task -- never video, never raw pose landmarks, never a photo.
+# That is a real privacy boundary, not just a comment: everything this
+# endpoint accepts is validated by type below, so there is no field a client
+# could smuggle a video frame or free-text health note through.
+#
+# Fails closed, not open: if ANTHROPIC_API_KEY is not set, this returns a
+# clean 503 rather than crashing the whole server or silently no-opping.
+# That means this feature can ship in the app today and simply stay off
+# until you add the key to your host's config -- no code change needed to
+# turn it on later.
+# ---------------------------------------------------------------------------
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-3-5-haiku-20241022")
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_TIMEOUT_SECONDS = int(os.environ.get("ANTHROPIC_TIMEOUT_SECONDS", "20"))
+
+# Separate, tighter rate limit from /analyze -- each call here costs real
+# money, unlike a local video analysis.
+AI_COACH_RATE_LIMIT_MAX_REQUESTS = int(
+    os.environ.get("AI_COACH_RATE_LIMIT_MAX_REQUESTS", "8"))
+AI_COACH_RATE_LIMIT_WINDOW_SECONDS = int(
+    os.environ.get("AI_COACH_RATE_LIMIT_WINDOW_SECONDS", "600"))
+_ai_coach_request_log = defaultdict(deque)
+
+
+def _is_ai_coach_rate_limited(client_key: str) -> bool:
+    now = time.time()
+    q = _ai_coach_request_log[client_key]
+    while q and now - q[0] > AI_COACH_RATE_LIMIT_WINDOW_SECONDS:
+        q.popleft()
+    if len(q) >= AI_COACH_RATE_LIMIT_MAX_REQUESTS:
+        return True
+    q.append(now)
+    return False
+
+
+_VALID_GRADE_CHARS = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -/.'"
+)
+
+
+def _clean_short_string(value, max_len=60):
+    """Coerce to a short, plain string or None. Strips anything that isn't
+    a simple grade/label character so nothing free-form (an attempted
+    prompt injection, a pasted note) reaches the model as if it were a
+    trusted field."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    text = "".join(ch for ch in text if ch in _VALID_GRADE_CHARS)
+    return text[:max_len] if text else None
+
+
+def _clean_score(value):
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return None
+    if score != score or score in (float("inf"), float("-inf")):  # NaN/inf
+        return None
+    return max(0, min(100, round(score)))
+
+
+@app.route("/ai-coach", methods=["POST"])
+def ai_coach():
+    if not ANTHROPIC_API_KEY:
+        return jsonify({
+            "error": "AI Coach not configured",
+            "details": (
+                "This server does not have an ANTHROPIC_API_KEY set, so AI "
+                "Coach is turned off. Nothing was sent anywhere."
+            ),
+        }), 503
+
+    if _is_ai_coach_rate_limited(_client_key()):
+        return jsonify({
+            "error": "Too many requests",
+            "details": (
+                f"Limit is {AI_COACH_RATE_LIMIT_MAX_REQUESTS} AI Coach "
+                f"requests per {AI_COACH_RATE_LIMIT_WINDOW_SECONDS} seconds. "
+                "Try again shortly."
+            ),
+        }), 429
+
+    payload = request.get_json(silent=True) or {}
+
+    task_label = _clean_short_string(payload.get("task_label")) or "Movement Check"
+    mode = _clean_short_string(payload.get("mode"), max_len=20) or "daily"
+    primary_grade = _clean_short_string(payload.get("primary_grade")) or "N/A"
+    confidence_grade = _clean_short_string(payload.get("confidence_grade"))
+    side = _clean_short_string(payload.get("side"), max_len=10)
+    primary_score = _clean_score(payload.get("primary_score"))
+    thresholds_calibrated = bool(payload.get("thresholds_calibrated"))
+
+    raw_recent_scores = payload.get("recent_scores")
+    recent_scores = []
+    if isinstance(raw_recent_scores, list):
+        for item in raw_recent_scores[:10]:  # hard cap, ignore the rest
+            cleaned = _clean_score(item)
+            if cleaned is not None:
+                recent_scores.append(cleaned)
+
+    facts_lines = [
+        f"- Task: {task_label} (mode: {mode})",
+        f"- Most recent score: {primary_score if primary_score is not None else 'N/A'}/100",
+        f"- Most recent grade: {primary_grade}",
+    ]
+    if confidence_grade:
+        facts_lines.append(f"- Tracking confidence for this recording: {confidence_grade}")
+    if side:
+        facts_lines.append(f"- Side tested: {side}")
+    facts_lines.append(
+        f"- Personalized calibration active: {'yes' if thresholds_calibrated else 'no (using default range)'}"
+    )
+    if recent_scores:
+        facts_lines.append(
+            f"- Recent scores for this same task, oldest to newest: {', '.join(str(s) for s in recent_scores)}"
+        )
+
+    facts_block = "\n".join(facts_lines)
+
+    system_prompt = (
+        "You are a movement-coaching assistant inside a phone app called Kinetra. "
+        "The app scores camera-based movement checks (built on Google MediaPipe "
+        "pose estimation). You are given ONLY numeric scores and letter grades for "
+        "one task -- you have not seen any video, image, or raw pose data, and you "
+        "must never claim otherwise.\n\n"
+        "Hard rules, no exceptions:\n"
+        "1. You are not a doctor, physical therapist, or athletic trainer, and you "
+        "must never diagnose a condition, name a suspected injury, or claim a "
+        "medical cause for a score. If a score suggests something concerning, say "
+        "so in plain terms and recommend an in-person clinician or athletic "
+        "trainer -- do not guess what might be wrong.\n"
+        "2. Keep the response to 3-5 short sentences. No headers, no bullet "
+        "lists, no markdown -- this renders as plain text in a mobile app.\n"
+        "3. Be specific to the numbers given, not generic fitness advice. If "
+        "there's a trend in recent scores, mention it plainly.\n"
+        "4. Never invent data you were not given (no fake percentages, no claims "
+        "about joints or muscles not implied by the task name).\n"
+        "5. Warm, direct, plain language -- talking to a teenager or an adult "
+        "rehab patient, not a clinician."
+    )
+
+    user_prompt = (
+        f"Here is this person's most recent Kinetra result:\n{facts_block}\n\n"
+        "Write a short, encouraging, specific coaching note about this result."
+    )
+
+    try:
+        response = requests.post(
+            ANTHROPIC_API_URL,
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": ANTHROPIC_MODEL,
+                "max_tokens": 300,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": user_prompt}],
+            },
+            timeout=ANTHROPIC_TIMEOUT_SECONDS,
+        )
+    except requests.exceptions.Timeout:
+        return jsonify({
+            "error": "AI Coach timed out",
+            "details": "The AI coaching service took too long to respond. Try again shortly.",
+        }), 504
+    except requests.exceptions.RequestException as e:
+        print(f"AI Coach network error: {e}")
+        return jsonify({
+            "error": "AI Coach unavailable",
+            "details": "Could not reach the AI coaching service. Try again shortly.",
+        }), 502
+
+    if response.status_code != 200:
+        print(f"AI Coach upstream error {response.status_code}: {response.text[:500]}")
+        return jsonify({
+            "error": "AI Coach unavailable",
+            "details": "The AI coaching service returned an error. Try again shortly.",
+        }), 502
+
+    try:
+        data = response.json()
+        feedback_text = "".join(
+            block.get("text", "")
+            for block in data.get("content", [])
+            if isinstance(block, dict) and block.get("type") == "text"
+        ).strip()
+    except (ValueError, AttributeError) as e:
+        print(f"AI Coach response parse error: {e}")
+        feedback_text = ""
+
+    if not feedback_text:
+        return jsonify({
+            "error": "AI Coach unavailable",
+            "details": "The AI coaching service returned an empty response. Try again shortly.",
+        }), 502
+
+    return jsonify({
+        "feedback": feedback_text,
+        "model": ANTHROPIC_MODEL,
+    }), 200
 
 
 if __name__ == "__main__":

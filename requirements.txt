@@ -1,8 +1,38 @@
-Flask
-flask-cors
-gunicorn
-opencv-python-headless
-mediapipe
-matplotlib
-numpy
-protobuf
+# Pinned 2026-09-13 after verifying this exact combination installs cleanly
+# (`pip check` reports no conflicts) and that pose_test.py's
+# `mediapipe.python.solutions.pose` import still works with it.
+#
+# Why pin at all -- reason 1: mediapipe removed the legacy
+# `mediapipe.python.solutions` API entirely in its 1.0 release
+# (`ModuleNotFoundError: No module named 'mediapipe.python'`), which is
+# exactly what an unpinned `pip install -r requirements.txt` would pull in
+# today. If you ever intentionally upgrade mediapipe to use its newer Tasks
+# API instead, pose_test.py's imports need to change to match.
+#
+# Why pin at all -- reason 2 (the one that actually cost hours to find):
+# mediapipe depends on `opencv-contrib-python`, but this project also
+# depends on `opencv-python-headless` -- both packages install files at the
+# exact same `cv2/` path, so whichever one pip happens to install *last*
+# silently overwrites the other's files on disk. Two `pip install -r
+# requirements.txt` runs of the exact same file can end up with genuinely
+# different OpenCV builds (4.9.0 vs 4.11.0 were both observed here), which
+# then feed mediapipe's pose model very slightly different decoded frames
+# and produce measurably different scores FOR THE IDENTICAL INPUT VIDEO --
+# confirmed reproducible: 35.2 vs 45.2 on the same test clip, same code,
+# "same" requirements.txt. Pinning opencv-contrib-python to the SAME
+# version as opencv-python-headless makes the outcome deterministic
+# regardless of which one wins the file collision, since they're then the
+# same underlying OpenCV build either way. If you ever bump
+# opencv-python-headless, bump opencv-contrib-python to match in the same
+# commit -- if a matching contrib version doesn't exist yet, freeze both,
+# don't half-upgrade.
+Flask==3.1.3
+flask-cors==6.0.5
+gunicorn==26.2.0
+requests==2.32.3
+opencv-python-headless==4.9.0.80
+opencv-contrib-python==4.9.0.80
+mediapipe==0.10.21
+matplotlib==3.11.2
+numpy==1.26.4
+protobuf==4.25.9
