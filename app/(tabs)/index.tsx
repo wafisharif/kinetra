@@ -1,3 +1,4 @@
+import { reportError } from '@/constants/crashReporting';
 import { useOnDevicePose } from '@/hooks/useOnDevicePose';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { CameraView, useCameraPermissions } from 'expo-camera';
@@ -33,14 +34,27 @@ Notifications.setNotificationHandler({
 });
 
 const REMINDER_NOTIFICATION_IDENTIFIER = 'kinetra-daily-reminder';
-const LOCAL_API_BASE_URL = 'http://192.168.1.163:5000';
 
-// ⚠️  This is an ngrok free-tier URL and WILL EXPIRE. For production
-// publish, replace it with your deployed backend URL (Render, Railway,
-// Fly.io, your own server, etc.). Leaving it here means the app stops
-// working as soon as ngrok kills the tunnel.
-// Example: const DEPLOYED_API_BASE_URL = 'https://your-app-name.onrender.com';
-const DEPLOYED_API_BASE_URL = 'https://unrest-busily-snort.ngrok-free.dev';
+// Backend URLs are config-driven via environment variables (see `.env` /
+// `.env.example` at the project root) instead of being hardcoded here. Expo
+// automatically loads `.env` and inlines any `EXPO_PUBLIC_`-prefixed variable
+// into the JS bundle at build/export time -- this is the standard Expo
+// mechanism for build-time config that isn't secret (the value ends up
+// visible in the client bundle either way, exactly like a hardcoded string
+// would). This means rotating a backend host (e.g. replacing an expiring
+// ngrok URL, or pointing a preview build at a staging server) is a one-line
+// edit to `.env`, never a source-code change to this 17,000-line file.
+//
+// The literal strings below are fallbacks only, used if `.env` is ever
+// missing -- they keep local development working out of the box but should
+// not be relied on for anything shipped.
+const LOCAL_API_BASE_URL = process.env.EXPO_PUBLIC_LOCAL_API_BASE_URL || 'http://192.168.1.163:5000';
+
+// ⚠️  The fallback below is an ngrok free-tier URL and WILL EXPIRE. Set
+// EXPO_PUBLIC_DEPLOYED_API_BASE_URL in `.env` to your real deployed backend
+// URL (Render, Railway, Fly.io, your own server, etc.) before shipping a
+// production or preview build.
+const DEPLOYED_API_BASE_URL = process.env.EXPO_PUBLIC_DEPLOYED_API_BASE_URL || 'https://unrest-busily-snort.ngrok-free.dev';
 
 // __DEV__ is a React Native global: true in a development build, false in a
 // production/release build. This used to be
@@ -59,6 +73,41 @@ const APP_DESCRIPTION =
   'Camera-based movement intelligence for tracking control, stability, mobility, and change over time.';
 const APP_SAFETY_NOTE =
   'Kinetra is for movement awareness only. It does not diagnose, treat, predict injury, estimate fall risk, or replace medical advice.';
+
+// Single source of truth for the version shown in Settings and the What's
+// New screen. Keep in sync with app.json's "version" field when it changes
+// -- there is deliberately no build-time wiring between the two (Expo's
+// app.json version isn't readable from inside the JS bundle without adding
+// expo-constants just for this one string), so bumping a release means
+// updating both by hand.
+const APP_VERSION = '0.1.0';
+
+// A real, append-only changelog. Each entry should describe what genuinely
+// shipped, in plain language a non-technical user would understand -- never
+// backfilled with invented past version numbers or dates for milestones
+// that didn't actually ship as separate releases. Add a new entry at the
+// TOP of this array when you cut a new version; never edit past entries.
+type WhatsNewEntry = {
+  version: string;
+  date: string; // human-readable, e.g. "September 2026" -- intentionally not day-precise, since exact ship dates for a solo project aren't a meaningful signal
+  highlights: string[];
+};
+const WHATS_NEW_ENTRIES: WhatsNewEntry[] = [
+  {
+    version: '0.1.0',
+    date: 'September 2026',
+    highlights: [
+      'Per-arm calibration: rep-detection thresholds can now be personalized separately for your left and right arm, instead of one fixed range for everyone.',
+      'Team Roster and Team Screening mode, for coaches or teachers checking movement quality across a group rather than one person at a time.',
+      'A Transparency page that plainly explains what Kinetra measures, its real limitations, and exactly what happens to your data and video.',
+      'AI Coach can now ask Claude for a short, personalized note based on your recent scores (opt-in on the backend; only numeric scores and grades are ever sent, never video).',
+      'Consistency Streaks and 8 honest achievement badges -- every badge is based on showing up and testing fully, never on getting a high score.',
+      'Local daily reminder notifications, scheduled entirely on your device -- no account or server involved.',
+      'A consolidated Settings screen for reminders, calibration, and privacy info.',
+      'A full pass to find and fix real layout bugs (text clipping instead of wrapping on a couple of summary screens) using an automated visual QA sweep across every screen.',
+    ],
+  },
+];
 
 type AnalysisResult = {
   mode: 'rep' | 'rehab' | 'lab' | 'daily';
@@ -5755,6 +5804,12 @@ export default function HomeScreen() {
   const [showBuilderTools, setShowBuilderTools] = useState(false);
   const [showReportExport, setShowReportExport] = useState(false);
   const [showAiCoach, setShowAiCoach] = useState(false);
+  // What's New / changelog. `lastSeenWhatsNewVersion` drives the small
+  // unread dot on the Home nav chip -- it's set to the current APP_VERSION
+  // the moment the screen is opened, so the dot disappears immediately
+  // rather than needing an explicit "dismiss" action.
+  const [showWhatsNew, setShowWhatsNew] = useState(false);
+  const [lastSeenWhatsNewVersion, setLastSeenWhatsNewVersion] = useState<string | null>(null);
   // Phase 4 (startup pivot): a REAL LLM-generated note, layered onto the
   // existing (rule-based) AI Coach screen. This is intentionally separate
   // from `coach` (getMovementCoachPlan) above -- that stays fast, free, and
@@ -6360,6 +6415,7 @@ export default function HomeScreen() {
       setLlmCoachNote(body.feedback);
     } catch (error: any) {
       clearTimeout(timeoutId);
+      reportError(error, { route: '/ai-coach' });
       setLlmCoachError(
         error?.name === 'AbortError'
           ? 'AI Coach took too long to respond. Try again shortly.'
@@ -6392,6 +6448,25 @@ export default function HomeScreen() {
     }
   };
 
+  const loadWhatsNewStatus = async () => {
+    try {
+      const raw = await AsyncStorage.getItem('last_seen_whats_new_version_v1');
+      setLastSeenWhatsNewVersion(raw);
+    } catch (error) {
+      console.log('Failed to load What\'s New status:', error);
+    }
+  };
+
+  const openWhatsNew = async () => {
+    setShowWhatsNew(true);
+    try {
+      await AsyncStorage.setItem('last_seen_whats_new_version_v1', APP_VERSION);
+      setLastSeenWhatsNewVersion(APP_VERSION);
+    } catch (error) {
+      console.log('Failed to save What\'s New status:', error);
+    }
+  };
+
   useEffect(() => {
     requestPermission();
     loadSavedSessions();
@@ -6400,6 +6475,7 @@ export default function HomeScreen() {
     loadOnboardingStatus();
     loadCalibration();
     loadReminderSettings();
+    loadWhatsNewStatus();
   }, [requestPermission]);
 
   // ----- On-device pose snapshot loop (Step 1) -----------------------------
@@ -6676,6 +6752,7 @@ export default function HomeScreen() {
       if (token !== uploadTokenRef.current) return null;
 
       console.error('Upload failed:', error);
+      reportError(error, { route: '/analyze', mode });
 
       const rawMessage =
         error?.name === 'AbortError'
@@ -7299,6 +7376,47 @@ export default function HomeScreen() {
     );
   }
 
+  if (showWhatsNew) {
+    return (
+      <ScrollView
+        style={styles.homeScroll}
+        contentContainerStyle={styles.cameraSetupContent}
+        showsVerticalScrollIndicator={false}
+      >
+        <View style={styles.heroBadge}>
+          <Text style={styles.heroBadgeText}>What&apos;s New</Text>
+        </View>
+
+        <Text style={styles.title}>What&apos;s New in {APP_NAME}</Text>
+
+        <Text style={styles.subtitle}>
+          A plain-language record of what&apos;s actually shipped, in order. Nothing here is
+          backfilled or invented -- if a change isn&apos;t listed, it hasn&apos;t shipped yet.
+        </Text>
+
+        {WHATS_NEW_ENTRIES.map((entry) => (
+          <View key={entry.version} style={styles.cameraSetupCard}>
+            <Text style={styles.sectionTitle}>
+              Version {entry.version} -- {entry.date}
+            </Text>
+            {entry.highlights.map((highlight, index) => (
+              <Text key={index} style={styles.cameraMistakeText}>
+                • {highlight}
+              </Text>
+            ))}
+          </View>
+        ))}
+
+        <Pressable
+          style={styles.mainButton}
+          onPress={() => setShowWhatsNew(false)}
+        >
+          <Text style={styles.buttonText}>Back Home</Text>
+        </Pressable>
+      </ScrollView>
+    );
+  }
+
   if (showSettings) {
     const reminderHourOptions = [
       { hour: 8, label: '8:00 AM' },
@@ -7428,9 +7546,18 @@ export default function HomeScreen() {
         <View style={styles.cameraSetupCard}>
           <Text style={styles.sectionTitle}>About</Text>
           <Text style={styles.dailyTaskDescription}>
-            {APP_NAME} {APP_BETA_LABEL} -- version 0.1.0{'\n'}
+            {APP_NAME} {APP_BETA_LABEL} -- version {APP_VERSION}{'\n'}
             Analysis server: {API_BASE_URL}
           </Text>
+          <Pressable
+            style={[styles.secondaryButton, { marginTop: 10 }]}
+            onPress={() => {
+              setShowSettings(false);
+              openWhatsNew();
+            }}
+          >
+            <Text style={styles.secondaryButtonText}>What&apos;s New</Text>
+          </Pressable>
         </View>
 
         <Pressable
@@ -10463,7 +10590,7 @@ export default function HomeScreen() {
             • Deploy Flask backend to a public URL.
           </Text>
           <Text style={styles.serverChecklistText}>
-            • Paste deployed URL into DEPLOYED_API_BASE_URL.
+            • Set EXPO_PUBLIC_DEPLOYED_API_BASE_URL in .env to the deployed URL.
           </Text>
           <Text style={styles.serverChecklistText}>
             • Add /health route to Flask.
@@ -11551,6 +11678,22 @@ export default function HomeScreen() {
               accessibilityLabel="Settings"
             >
               <Text style={styles.howItWorksButtonText}>Settings</Text>
+            </Pressable>
+
+            <Pressable
+              style={[styles.howItWorksButton, { position: 'relative' }]}
+              onPress={openWhatsNew}
+              accessibilityRole="button"
+              accessibilityLabel={
+                lastSeenWhatsNewVersion !== APP_VERSION
+                  ? "What's New (unread)"
+                  : "What's New"
+              }
+            >
+              <Text style={styles.howItWorksButtonText}>What&apos;s New</Text>
+              {lastSeenWhatsNewVersion !== APP_VERSION ? (
+                <View style={styles.unreadDot} />
+              ) : null}
             </Pressable>
 
             <Pressable
@@ -14914,6 +15057,7 @@ const styles = StyleSheet.create({
 
   testingStatBox: {
     flexGrow: 1,
+    flexShrink: 1,
     minWidth: '45%',
     backgroundColor: 'rgba(15, 23, 42, 0.72)',
     borderWidth: 1,
@@ -15312,6 +15456,7 @@ const styles = StyleSheet.create({
 
   rolloutStatBox: {
     flexGrow: 1,
+    flexShrink: 1,
     minWidth: '45%',
     backgroundColor: 'rgba(15, 23, 42, 0.72)',
     borderWidth: 1,
@@ -15345,6 +15490,7 @@ const styles = StyleSheet.create({
 
   rolloutActionButton: {
     flexGrow: 1,
+    flexShrink: 1,
     minWidth: '45%',
     backgroundColor: 'rgba(37, 99, 235, 0.92)',
     borderWidth: 1,
@@ -15616,6 +15762,7 @@ const styles = StyleSheet.create({
 
   betaLaunchStatBox: {
     flexGrow: 1,
+    flexShrink: 1,
     minWidth: '45%',
     backgroundColor: 'rgba(15, 23, 42, 0.72)',
     borderWidth: 1,
@@ -15766,6 +15913,7 @@ const styles = StyleSheet.create({
 
   testerAnalyticsStatBox: {
     flexGrow: 1,
+    flexShrink: 1,
     minWidth: '45%',
     backgroundColor: 'rgba(15, 23, 42, 0.72)',
     borderWidth: 1,
@@ -15912,6 +16060,7 @@ const styles = StyleSheet.create({
 
   dailyHealthStatBox: {
     flexGrow: 1,
+    flexShrink: 1,
     minWidth: '45%',
     backgroundColor: 'rgba(15, 23, 42, 0.72)',
     borderWidth: 1,
@@ -16097,6 +16246,7 @@ const styles = StyleSheet.create({
 
   builderStatBox: {
     flexGrow: 1,
+    flexShrink: 1,
     minWidth: '45%',
     backgroundColor: 'rgba(15, 23, 42, 0.72)',
     borderWidth: 1,
@@ -16130,6 +16280,7 @@ const styles = StyleSheet.create({
 
   builderToolButton: {
     flexGrow: 1,
+    flexShrink: 1,
     minWidth: '45%',
     backgroundColor: 'rgba(51, 65, 85, 0.9)',
     borderWidth: 1,
@@ -16278,6 +16429,7 @@ const styles = StyleSheet.create({
 
   reportStatBox: {
     flexGrow: 1,
+    flexShrink: 1,
     minWidth: '45%',
     backgroundColor: 'rgba(15, 23, 42, 0.72)',
     borderWidth: 1,
@@ -16395,6 +16547,7 @@ const styles = StyleSheet.create({
 
   passportSnapshotCard: {
     flexGrow: 1,
+    flexShrink: 1,
     minWidth: '45%',
     backgroundColor: 'rgba(15, 23, 42, 0.72)',
     borderWidth: 1,
@@ -16433,6 +16586,7 @@ const styles = StyleSheet.create({
 
   passportHighlightCard: {
     flexGrow: 1,
+    flexShrink: 1,
     minWidth: '45%',
     backgroundColor: 'rgba(30, 41, 59, 0.92)',
     borderWidth: 1,
@@ -16475,6 +16629,7 @@ const styles = StyleSheet.create({
 
   passportTrendBox: {
     flexGrow: 1,
+    flexShrink: 1,
     minWidth: '22%',
     backgroundColor: 'rgba(15, 23, 42, 0.72)',
     borderWidth: 1,
@@ -16672,6 +16827,7 @@ const styles = StyleSheet.create({
 
   longitudinalStatBox: {
     flexGrow: 1,
+    flexShrink: 1,
     minWidth: '22%',
     backgroundColor: 'rgba(15, 23, 42, 0.72)',
     borderWidth: 1,
@@ -16855,6 +17011,7 @@ const styles = StyleSheet.create({
 
   aiCoachStatBox: {
     flexGrow: 1,
+    flexShrink: 1,
     minWidth: '30%',
     backgroundColor: 'rgba(15, 23, 42, 0.72)',
     borderWidth: 1,
@@ -17009,6 +17166,7 @@ const styles = StyleSheet.create({
 
   weeklyStatBox: {
     flexGrow: 1,
+    flexShrink: 1,
     minWidth: '45%',
     backgroundColor: 'rgba(15, 23, 42, 0.72)',
     borderWidth: 1,
@@ -17183,6 +17341,7 @@ const styles = StyleSheet.create({
 
   mobilityStatBox: {
     flexGrow: 1,
+    flexShrink: 1,
     minWidth: '30%',
     backgroundColor: 'rgba(15, 23, 42, 0.72)',
     borderWidth: 1,
@@ -17217,6 +17376,7 @@ const styles = StyleSheet.create({
 
   mobilityHighlightCard: {
     flexGrow: 1,
+    flexShrink: 1,
     minWidth: '45%',
     backgroundColor: 'rgba(30, 41, 59, 0.92)',
     borderWidth: 1,
@@ -17560,6 +17720,7 @@ const styles = StyleSheet.create({
 
   yoloStatBox: {
     flexGrow: 1,
+    flexShrink: 1,
     minWidth: '30%',
     backgroundColor: 'rgba(15, 23, 42, 0.72)',
     borderWidth: 1,
@@ -17787,6 +17948,18 @@ const styles = StyleSheet.create({
     color: '#cbd5e1',
     fontSize: 12,
     fontWeight: '800',
+  },
+
+  unreadDot: {
+    position: 'absolute',
+    top: -3,
+    right: -3,
+    width: 9,
+    height: 9,
+    borderRadius: 5,
+    backgroundColor: '#38bdf8',
+    borderWidth: 1.5,
+    borderColor: '#0f172a',
   },
 
   quickStartBox: {

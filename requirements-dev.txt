@@ -1,0 +1,5 @@
+# Test-only dependencies, kept separate from requirements.txt so the
+# production server (Render/Railway/your host) never installs test tooling
+# it doesn't need. Install with:
+#   pip install -r requirements.txt -r requirements-dev.txt
+pytest==8.3.4

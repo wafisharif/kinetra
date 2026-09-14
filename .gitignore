@@ -51,3 +51,9 @@ uploaded*.mp4
 .venv/
 venv/
 env/
+.pytest_cache/
+
+# test output (Playwright)
+/test-results/
+/playwright-report/
+/blob-report/
