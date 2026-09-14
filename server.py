@@ -429,7 +429,6 @@ def ai_coach():
 
     return jsonify({
         "feedback": feedback_text,
-        "model": ANTHROPIC_MODEL,
     }), 200
 
 

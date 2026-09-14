@@ -66,7 +66,11 @@ def test_successful_response_shape_and_upstream_call(client, monkeypatch):
         assert resp.status_code == 200
         body = resp.get_json()
         assert body.get("feedback") == "Nice work, your reach score improved this week!"
-        assert "model" in body
+        # The response is deliberately minimal -- no model identifier or any
+        # other implementation detail is ever exposed to the client, since
+        # nothing in the app displays it and it has no reason to leak which
+        # AI provider or model is behind this feature.
+        assert set(body.keys()) == {"feedback"}
         assert mock_post.call_count == 1
 
         call_kwargs = mock_post.call_args.kwargs

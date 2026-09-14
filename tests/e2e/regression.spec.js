@@ -83,12 +83,12 @@ test.describe('Kinetra regression suite', () => {
     expect(text).toContain('How Kinetra Actually Measures Movement');
   });
 
-  test('AI Coach screen has both the rule-based coach and Ask Claude section', async ({ page }) => {
+  test('AI Coach screen has both the rule-based coach and Ask AI section', async ({ page }) => {
     await clickText(page, 'AI Coach');
     await page.waitForTimeout(600);
     const text = await page.locator('body').innerText();
     expect(text).toContain('Coach Summary');
-    expect(text).toContain('Ask Claude for a Personal Note');
+    expect(text).toContain('Ask AI for a Personal Note');
   });
 
   test('Mobility Profile highlight cards wrap their text instead of clipping it', async ({ page }) => {
