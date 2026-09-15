@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from werkzeug.middleware.proxy_fix import ProxyFix
 import os
 import time
 import uuid
@@ -12,6 +13,20 @@ from pose_test import run_analysis
 
 app = Flask(__name__)
 CORS(app)
+
+# Trust exactly one reverse-proxy hop for client-IP resolution. Render,
+# Railway, Fly.io, and Heroku-style PaaS hosts all put exactly one proxy
+# between the internet and this app, which sets X-Forwarded-For to the real
+# client IP. Without this, request.remote_addr would be the proxy's own IP
+# for every request (rate limiting would key on one shared value for
+# everyone), and reading X-Forwarded-For by hand (the previous approach) is
+# spoofable -- a client can send their own X-Forwarded-For header and have
+# it treated as trusted. ProxyFix understands the "one trusted hop" case
+# correctly: it takes the entry the proxy itself appended, not whatever the
+# client sent. If this is ever deployed behind more than one proxy layer
+# (e.g. a CDN in front of the PaaS host too), bump x_for to match the
+# number of hops, in the same change.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
 
 # Keep uploads reasonable for deployment.
 # 80 MB is still large, but safer than unlimited uploads.
@@ -62,12 +77,13 @@ def _run_with_timeout(func, timeout_seconds, *args, **kwargs):
 # ---------------------------------------------------------------------------
 # Minimal best-effort rate limiting.
 #
-# This is NOT hardened security (a client can spoof X-Forwarded-For), but
-# /analyze currently has no auth at all and runs a real video-processing
-# pipeline per request -- this is just a cheap guard against one script
-# flooding the single worker with requests, not a defense against a
-# determined attacker. Revisit with real auth before this is used beyond
-# your own testing/beta group.
+# This is still NOT hardened security -- /analyze has no auth at all and
+# runs a real video-processing pipeline per request, so this is a cheap
+# guard against one script flooding the worker, not a defense against a
+# determined attacker who controls many IPs. ProxyFix (above) at least
+# means the client key is the real client IP rather than a value the
+# client can freely spoof via a hand-crafted header. Revisit with real
+# auth before this is used beyond your own testing/beta group.
 # ---------------------------------------------------------------------------
 RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", "20"))
 RATE_LIMIT_WINDOW_SECONDS = int(
@@ -87,9 +103,9 @@ def _is_rate_limited(client_key: str) -> bool:
 
 
 def _client_key() -> str:
-    forwarded = request.headers.get("X-Forwarded-For", "")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
+    # ProxyFix has already rewritten request.remote_addr to the real client
+    # IP (from the trusted proxy hop's X-Forwarded-For entry), so there is
+    # no need to re-parse the header by hand here anymore.
     return request.remote_addr or "unknown"
 
 
@@ -154,6 +170,15 @@ def analyze():
 
     upload_id = uuid.uuid4().hex
     filepath = UPLOAD_DIR / f"uploaded_{upload_id}.mp4"
+    # Per-request debug CSV path (was a single shared "elbow_angles.csv"
+    # before): with a shared path, two /analyze requests running at the same
+    # time would both open the same file in write mode and could interleave
+    # or clobber each other's rows. This deployment currently runs a single
+    # gunicorn worker (see Procfile) so that couldn't happen today, but a
+    # unique per-request path costs nothing and removes the race entirely if
+    # workers are ever increased for throughput. It's deleted in the
+    # `finally` block below, same as the uploaded video.
+    csv_path = UPLOAD_DIR / f"angles_{upload_id}.csv"
 
     try:
         file.save(filepath)
@@ -171,7 +196,7 @@ def analyze():
             video_path=str(filepath),
             mode=mode,
             daily_task=daily_task,
-            output_csv=str(BASE_DIR / "elbow_angles.csv"),
+            output_csv=str(csv_path),
             backend_mode=True,
             side=side,
             flex_threshold=flex_threshold,
@@ -210,6 +235,11 @@ def analyze():
                 filepath.unlink()
         except Exception as cleanup_error:
             print(f"Cleanup failed for {filepath}: {cleanup_error}")
+        try:
+            if csv_path.exists():
+                csv_path.unlink()
+        except Exception as cleanup_error:
+            print(f"Cleanup failed for {csv_path}: {cleanup_error}")
 
 
 # ---------------------------------------------------------------------------

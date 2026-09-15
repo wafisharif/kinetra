@@ -29,10 +29,26 @@
 Flask==3.1.3
 flask-cors==6.0.5
 gunicorn==26.2.0
-requests==2.32.3
+# Bumped from 2.32.3 (2026-09-15) to pick up two published security fixes
+# (pip-audit: PYSEC-2026-1872, PYSEC-2026-2275). requests has an excellent
+# backward-compatibility track record across minor versions and this app's
+# usage is minimal/standard (requests.post with headers/json/timeout,
+# requests.exceptions.Timeout/RequestException) -- verified against the
+# full backend test suite after bumping, no other changes needed.
+requests==2.34.2
 opencv-python-headless==4.9.0.80
 opencv-contrib-python==4.9.0.80
 mediapipe==0.10.21
 matplotlib==3.11.2
 numpy==1.26.4
+# pip-audit flags this version (PYSEC-2026-1805, fixed in 5.29.6 / 6.33.5).
+# Deliberately NOT bumped: mediapipe==0.10.21 was pinned above specifically
+# because of a prior incident where an unpinned transitive dependency
+# (opencv) silently changed pose-estimation output for identical input --
+# protobuf is exactly the same kind of deep, ABI-sensitive transitive
+# dependency of mediapipe, and a major version bump (4.x -> 5.x/6.x) risks
+# the same class of silent correctness regression, verifiable only by
+# re-running real videos through the full pipeline and comparing scores,
+# not by tests alone. Revisit deliberately, with that verification, rather
+# than as part of a routine dependency bump.
 protobuf==4.25.9

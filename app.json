@@ -10,7 +10,10 @@
     "newArchEnabled": true,
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.wafisharif.kinetra"
+      "bundleIdentifier": "com.wafisharif.kinetra",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
     "android": {
       "package": "com.wafisharif.kinetra",

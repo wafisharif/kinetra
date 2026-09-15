@@ -69,8 +69,6 @@ const SERVER_HEALTH_TIMEOUT_MS = 8000;
 const APP_NAME = 'Kinetra';
 const APP_TAGLINE = 'Understand Movement. Move Better.';
 const APP_BETA_LABEL = 'Beta';
-const APP_DESCRIPTION =
-  'Camera-based movement intelligence for tracking control, stability, mobility, and change over time.';
 const APP_SAFETY_NOTE =
   'Kinetra is for movement awareness only. It does not diagnose, treat, predict injury, estimate fall risk, or replace medical advice.';
 
@@ -249,7 +247,7 @@ type AnalysisResult = {
     control_grade: string;
     efficiency_grade: string;
   };
-  rep_analysis: Array<{
+  rep_analysis: {
     rep: number;
     start: number;
     end: number;
@@ -261,7 +259,7 @@ type AnalysisResult = {
     control_grade: string;
     score: number | null;
     score_grade: string;
-  }>;
+  }[];
 
   best_rep?: {
     rep: number;
@@ -3247,45 +3245,6 @@ function getLatestMovementReport(sessions: SavedSession[]) {
     baselinePercent: dailyHealth.baselinePercent,
     items: dailyHealth.items,
   };
-}
-
-function getMovementReportText(sessions: SavedSession[]) {
-  const report = getLatestMovementReport(sessions);
-
-  const areaLines = report.items.map((item) => {
-    const scoreText = item.score !== null ? `${item.score}/100` : 'No score yet';
-    const baselineText =
-      item.baselineScore !== null ? `baseline ${item.baselineScore}/100` : 'baseline still building';
-
-    return `- ${item.label}: ${scoreText} • ${item.status} • ${baselineText} • ${item.detail}`;
-  });
-
-  return `Movement Health Report
-
-Generated:
-${formatSessionDate(report.generatedAt)}
-
-Overall Status:
-${report.status}
-
-Summary:
-${report.summary}
-
-Main Focus:
-${report.focus}
-
-Recommended Next Check:
-${report.nextCheck}
-
-Profile Completion:
-${report.completenessPercent}% movement profile complete
-${report.baselinePercent}% baselines built
-
-Movement Areas:
-${areaLines.join('\n')}
-
-Important:
-This report is for movement awareness and tracking only. It does not diagnose, treat, or replace medical advice.`;
 }
 
 function getPassportTrendSummaryForTask(sessions: SavedSession[], task: DailyTask) {
@@ -6467,6 +6426,13 @@ export default function HomeScreen() {
     }
   };
 
+  // Deliberately a run-once-on-mount effect: every load* function here is a
+  // plain (non-memoized) closure, recreated on every render, so adding them
+  // to the dependency array would make this effect re-run on every render
+  // instead of once. That would be a real behavioral bug for
+  // loadReminderSettings in particular -- it re-requests notification
+  // permission and re-schedules the reminder notification, which should
+  // only happen when the screen first mounts, not on every re-render.
   useEffect(() => {
     requestPermission();
     loadSavedSessions();
@@ -6476,6 +6442,7 @@ export default function HomeScreen() {
     loadCalibration();
     loadReminderSettings();
     loadWhatsNewStatus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [requestPermission]);
 
   // ----- On-device pose snapshot loop (Step 1) -----------------------------
@@ -6519,6 +6486,17 @@ export default function HomeScreen() {
       cancelled = true;
       clearInterval(intervalId);
     };
+    // The linter wants the whole `onDevicePose` object here, but that would
+    // be wrong: useOnDevicePose() returns a brand-new object literal on
+    // every render, so depending on it directly would tear down and
+    // recreate this interval on every re-render -- while recording, that
+    // can happen faster than the 1s tick, so the loop could end up never
+    // firing at all. The two properties this effect actually reads,
+    // `ready` and `detect`, are both already listed individually below,
+    // and `detect` is itself wrapped in useCallback (see useOnDevicePose.tsx)
+    // so its identity is stable except when `ready` changes -- exactly the
+    // case this effect needs to react to.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [recording, cameraReady, onDevicePose.ready, onDevicePose.detect]);
 
   // Android hardware back button: if the user is mid-recording or mid-
@@ -6690,7 +6668,7 @@ export default function HomeScreen() {
 
       try {
         data = await response.json();
-      } catch (jsonError) {
+      } catch {
         throw new Error(
           `Backend returned a non-JSON response with status ${response.status}. Restart Flask or check backend logs.`
         );
@@ -11915,6 +11893,10 @@ export default function HomeScreen() {
               </Pressable>
             ))}
           </View>
+
+          <Text style={styles.modeDescriptionText}>
+            {getModeDescription(mode)}
+          </Text>
 
           <View style={styles.dailyTaskBlock}>
             <Text style={styles.dailyTaskTitle}>Which Arm Are You Testing?</Text>
@@ -18172,6 +18154,12 @@ const styles = StyleSheet.create({
   },
   modeChipTextActive: {
     color: '#ffffff',
+  },
+  modeDescriptionText: {
+    color: '#cbd5e1',
+    fontSize: 13,
+    lineHeight: 19,
+    marginBottom: 18,
   },
   startFeatureGrid: {
     width: '100%',

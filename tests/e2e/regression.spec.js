@@ -51,6 +51,11 @@ test.describe('Kinetra regression suite', () => {
     expect(text).toContain('Kinetra');
     expect(text).toContain('Team Roster');
     expect(text).toContain('Settings');
+    // Regression check: the mode selector chips (REP/REHAB/DAILY/LAB) used
+    // to show no explanation of what each mode means. Confirms the
+    // corresponding description text for the default mode ('rep') actually
+    // renders alongside them now.
+    expect(text).toContain('Analyze repeated movement quality');
   });
 
   test('team roster shows athletes and flags the poor grade', async ({ page }) => {

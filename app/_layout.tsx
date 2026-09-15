@@ -4,6 +4,7 @@ import { StatusBar } from 'expo-status-bar';
 import { useEffect } from 'react';
 import 'react-native-reanimated';
 
+import { ErrorBoundary } from '@/components/error-boundary';
 import { initCrashReporting } from '@/constants/crashReporting';
 import { useColorScheme } from '@/hooks/use-color-scheme';
 
@@ -21,12 +22,14 @@ export default function RootLayout() {
   }, []);
 
   return (
-    <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
-      <Stack>
-        <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
-        <Stack.Screen name="modal" options={{ presentation: 'modal', title: 'Modal' }} />
-      </Stack>
-      <StatusBar style="auto" />
-    </ThemeProvider>
+    <ErrorBoundary>
+      <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
+        <Stack>
+          <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+          <Stack.Screen name="modal" options={{ presentation: 'modal', title: 'Modal' }} />
+        </Stack>
+        <StatusBar style="auto" />
+      </ThemeProvider>
+    </ErrorBoundary>
   );
 }
