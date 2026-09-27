@@ -41,6 +41,49 @@ async function seedAndReload(page) {
   await page.waitForTimeout(1200);
 }
 
+// Sessions + Daily Check-Ins crafted so the Insight Engine's rules are each
+// deterministically satisfied exactly once, with no ambiguity about which
+// check-in a session should be compared against:
+//   - Streak: 3 consecutive check-in days (today, yesterday, 2 days ago).
+//   - Soreness<->score correlation (Reach task): 4 Reach sessions spaced 2
+//     days apart (so each is >36h from every other check-in but its own),
+//     alternating a "sore" day (Shoulders/Neck reported) with a "clear" day.
+//     Sore-day average (56.5) is far enough below clear-day average (89)
+//     to clear the engine's 8-point threshold.
+//   - Left/right asymmetry (Arm Raise task): 2 right-side sessions well
+//     above 2 left-side sessions (30-point gap, past the 15-point threshold).
+const INSIGHT_SCENARIO_SESSIONS = [
+  { id: 'r1', timestamp: daysAgo(10, 12), mode: 'daily', daily_task: 'reach', daily_task_label: 'Reach', primary_score: 55, primary_grade: 'Fair', side: 'right' },
+  { id: 'r2', timestamp: daysAgo(12, 12), mode: 'daily', daily_task: 'reach', daily_task_label: 'Reach', primary_score: 90, primary_grade: 'Good', side: 'right' },
+  { id: 'r3', timestamp: daysAgo(14, 12), mode: 'daily', daily_task: 'reach', daily_task_label: 'Reach', primary_score: 58, primary_grade: 'Fair', side: 'right' },
+  { id: 'r4', timestamp: daysAgo(16, 12), mode: 'daily', daily_task: 'reach', daily_task_label: 'Reach', primary_score: 88, primary_grade: 'Good', side: 'right' },
+  { id: 'a1', timestamp: daysAgo(20, 12), mode: 'daily', daily_task: 'arm_raise', daily_task_label: 'Arm Raise', primary_score: 90, primary_grade: 'Good', side: 'right' },
+  { id: 'a2', timestamp: daysAgo(21, 12), mode: 'daily', daily_task: 'arm_raise', daily_task_label: 'Arm Raise', primary_score: 85, primary_grade: 'Good', side: 'right' },
+  { id: 'a3', timestamp: daysAgo(22, 12), mode: 'daily', daily_task: 'arm_raise', daily_task_label: 'Arm Raise', primary_score: 60, primary_grade: 'Fair', side: 'left' },
+  { id: 'a4', timestamp: daysAgo(23, 12), mode: 'daily', daily_task: 'arm_raise', daily_task_label: 'Arm Raise', primary_score: 55, primary_grade: 'Fair', side: 'left' },
+];
+
+const INSIGHT_SCENARIO_CHECKINS = [
+  { id: 'c0', timestamp: daysAgo(0, 12), feeling: 3, soreness: [] },
+  { id: 'c1', timestamp: daysAgo(1, 12), feeling: 3, soreness: [] },
+  { id: 'c2', timestamp: daysAgo(2, 12), feeling: 3, soreness: [] },
+  { id: 'c10', timestamp: daysAgo(10, 12), feeling: 3, soreness: ['Shoulders'] },
+  { id: 'c12', timestamp: daysAgo(12, 12), feeling: 4, soreness: [] },
+  { id: 'c14', timestamp: daysAgo(14, 12), feeling: 2, soreness: ['Shoulders', 'Neck'] },
+  { id: 'c16', timestamp: daysAgo(16, 12), feeling: 5, soreness: [] },
+];
+
+async function seedInsightScenarioAndReload(page) {
+  await page.goto('/');
+  await page.evaluate(({ sessions, checkIns }) => {
+    window.localStorage.setItem('has_seen_onboarding_v1', 'true');
+    window.localStorage.setItem('movement_sessions_v1', JSON.stringify(sessions));
+    window.localStorage.setItem('daily_checkins_v1', JSON.stringify(checkIns));
+  }, { sessions: INSIGHT_SCENARIO_SESSIONS, checkIns: INSIGHT_SCENARIO_CHECKINS });
+  await page.reload();
+  await page.waitForTimeout(1200);
+}
+
 test.describe('Kinetra regression suite', () => {
   test.beforeEach(async ({ page }) => {
     await seedAndReload(page);
@@ -137,6 +180,58 @@ test.describe('Kinetra regression suite', () => {
         .filter((r) => r.width > 1 && (r.right > viewportWidth + 3 || r.left < -3)).length;
     }, 375);
     expect(overflowing).toBe(0);
+  });
+
+  test('home shows the Daily Check-In card and the check-in flow saves data', async ({ page }) => {
+    // Regression + feature test for the low-effort, no-camera Daily
+    // Check-In: every other tracking surface in the app requires recording
+    // a movement first. This confirms the check-in entry point is visible
+    // on first load, and that completing it round-trips through
+    // AsyncStorage (localStorage on web) and updates the home screen.
+    let text = await page.locator('body').innerText();
+    expect(text).toContain('Quick Daily Check-In');
+    expect(text).toContain('Check In Now');
+
+    await clickText(page, 'Check In Now');
+    await page.waitForTimeout(400);
+    text = await page.locator('body').innerText();
+    expect(text).toContain('How Are You Feeling Today?');
+
+    await clickText(page, 'Good', { exact: true });
+    await clickText(page, 'Knees', { exact: true });
+    await clickText(page, 'Save Check-In');
+    await page.waitForTimeout(400);
+
+    text = await page.locator('body').innerText();
+    expect(text).toContain("Saved today's check-in.");
+
+    await clickText(page, 'Back Home');
+    await page.waitForTimeout(400);
+    text = await page.locator('body').innerText();
+    expect(text).toContain("Today's Check-In Done");
+
+    const stored = await page.evaluate(() => window.localStorage.getItem('daily_checkins_v1'));
+    const parsed = JSON.parse(stored);
+    expect(parsed.length).toBe(1);
+    expect(parsed[0].feeling).toBe(4);
+    expect(parsed[0].soreness).toContain('Knees');
+  });
+
+  test('Insights screen surfaces streak, correlation, and asymmetry patterns', async ({ page }) => {
+    // Regression test for the Insight Engine -- the app's cross-referencing
+    // feature that combines subjective Daily Check-Ins with objective
+    // recorded scores. Uses a hand-crafted, deterministic scenario (see
+    // INSIGHT_SCENARIO_* above) so this asserts on the engine's actual
+    // math, not just that the screen renders something.
+    await seedInsightScenarioAndReload(page);
+
+    await clickText(page, 'Insights', { exact: true });
+    await page.waitForTimeout(600);
+    const text = await page.locator('body').innerText();
+
+    expect(text).toContain('3-day check-in streak');
+    expect(text).toContain('Reach scores are lower on Shoulders');
+    expect(text).toContain('Arm Raise: right side outperforming left by 30 points');
   });
 
   test('no unexpected console or page errors across the flows above', async ({ page }) => {

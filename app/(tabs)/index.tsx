@@ -345,6 +345,78 @@ type ServerHealthState = {
 type AnalysisBackend = 'mediapipe' | 'yolo';
 type DailyTask = 'reach' | 'arm_raise' | 'sit_to_stand' | 'walking' | 'balance' | 'timed_up_and_go';
 
+// ---------------------------------------------------------------------------
+// Daily Check-In: a fully local, no-camera subjective log.
+//
+// Every other tracking surface in this app (Movement Overview, Trend
+// Engine, Mobility Profile, Movement Passport) requires recording a video
+// first -- real, meaningful effort. This is the deliberately low-effort
+// counterpart: a couple of taps, no camera, no upload, done in well under
+// 30 seconds. On its own it gives a "how am I trending" signal to anyone
+// who doesn't want to record a full check every day. Combined with
+// recorded sessions, it feeds the Insight Engine below -- the only place
+// in the app that cross-references self-reported soreness against
+// objective recorded scores.
+// ---------------------------------------------------------------------------
+type SorenessRegion =
+  | 'Neck'
+  | 'Shoulders'
+  | 'Upper Back'
+  | 'Lower Back'
+  | 'Hips'
+  | 'Knees'
+  | 'Ankles/Feet';
+
+const SORENESS_REGIONS: SorenessRegion[] = [
+  'Neck',
+  'Shoulders',
+  'Upper Back',
+  'Lower Back',
+  'Hips',
+  'Knees',
+  'Ankles/Feet',
+];
+
+type DailyCheckIn = {
+  id: string;
+  timestamp: string;
+  // 1 = rough, 5 = great. One combined scale instead of separate
+  // "energy"/"mood" fields -- fewer taps for a comparably useful signal.
+  feeling: 1 | 2 | 3 | 4 | 5;
+  soreness: SorenessRegion[];
+  note?: string;
+};
+
+// Which daily tasks a given soreness region is mechanically relevant to.
+// Used by the Insight Engine to decide which recorded scores are actually
+// worth comparing against a reported soreness day. Deliberately
+// conservative -- only regions with an obvious biomechanical link to the
+// task are listed, so correlations stay plausible rather than spurious.
+const TASK_RELEVANT_REGIONS: Record<DailyTask, SorenessRegion[]> = {
+  reach: ['Neck', 'Shoulders', 'Upper Back'],
+  arm_raise: ['Neck', 'Shoulders', 'Upper Back'],
+  sit_to_stand: ['Hips', 'Knees', 'Lower Back'],
+  walking: ['Hips', 'Knees', 'Ankles/Feet', 'Lower Back'],
+  balance: ['Hips', 'Knees', 'Ankles/Feet'],
+  timed_up_and_go: ['Hips', 'Knees', 'Ankles/Feet', 'Lower Back'],
+};
+
+type Insight = {
+  id: string;
+  kind: 'streak' | 'checkin_trend' | 'correlation' | 'asymmetry';
+  tone: 'positive' | 'watch' | 'info';
+  headline: string;
+  detail: string;
+};
+
+const FEELING_LABELS: Record<1 | 2 | 3 | 4 | 5, string> = {
+  1: 'Rough',
+  2: 'Meh',
+  3: 'OK',
+  4: 'Good',
+  5: 'Great',
+};
+
 type MovementModuleId =
   | 'rep_quality'
   | 'rehab_consistency'
@@ -3793,6 +3865,277 @@ function getTaskLongitudinalTrend(sessions: SavedSession[], task: DailyTask) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Daily Check-In + Insight Engine helpers.
+//
+// Everything below is pure and runs entirely on-device against data already
+// in memory -- no network call, no LLM, no backend involvement. That keeps
+// it free to compute on every render and means it works completely offline,
+// which matters for a feature explicitly aimed at people who don't want to
+// put in camera-recording effort every day.
+// ---------------------------------------------------------------------------
+
+function isSameCalendarDay(aIso: string, bIso: string) {
+  const a = new Date(aIso);
+  const b = new Date(bIso);
+  return (
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
+  );
+}
+
+function getTodayCheckIn(checkIns: DailyCheckIn[]): DailyCheckIn | null {
+  const nowIso = new Date().toISOString();
+  return checkIns.find((c) => isSameCalendarDay(c.timestamp, nowIso)) ?? null;
+}
+
+function hasCheckedInToday(checkIns: DailyCheckIn[]): boolean {
+  return getTodayCheckIn(checkIns) !== null;
+}
+
+// Counts consecutive calendar days with at least one check-in, counting
+// backward from today. A streak stays "alive" through today even before
+// today's check-in happens yet, so simply not having checked in *yet* this
+// morning doesn't wipe out yesterday's streak.
+function getCheckInStreak(checkIns: DailyCheckIn[]): number {
+  if (checkIns.length === 0) return 0;
+
+  const dayKeys = Array.from(
+    new Set(checkIns.map((c) => new Date(c.timestamp).toDateString()))
+  );
+  const days = dayKeys
+    .map((k) => {
+      const d = new Date(k);
+      d.setHours(0, 0, 0, 0);
+      return d;
+    })
+    .sort((a, b) => b.getTime() - a.getTime());
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const mostRecentGapDays = Math.round(
+    (today.getTime() - days[0].getTime()) / 86400000
+  );
+  if (mostRecentGapDays > 1) return 0;
+
+  let streak = 1;
+  for (let i = 1; i < days.length; i++) {
+    const gapDays = Math.round(
+      (days[i - 1].getTime() - days[i].getTime()) / 86400000
+    );
+    if (gapDays === 1) {
+      streak += 1;
+    } else {
+      break;
+    }
+  }
+  return streak;
+}
+
+// Summarizes the last (up to) 7 check-ins -- the "low-effort path": this
+// works even for a user who has never recorded a single movement check.
+function getCheckInSummary(checkIns: DailyCheckIn[]) {
+  const recentWindow = checkIns
+    .slice()
+    .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+    .slice(0, 7);
+
+  if (recentWindow.length === 0) return null;
+
+  const avgFeeling =
+    recentWindow.reduce((sum, c) => sum + c.feeling, 0) / recentWindow.length;
+
+  const regionCounts: Partial<Record<SorenessRegion, number>> = {};
+  recentWindow.forEach((c) => {
+    c.soreness.forEach((region) => {
+      regionCounts[region] = (regionCounts[region] ?? 0) + 1;
+    });
+  });
+
+  const sortedRegions = (Object.entries(regionCounts) as [SorenessRegion, number][]).sort(
+    (a, b) => b[1] - a[1]
+  );
+  const topRegion = sortedRegions[0] ?? null;
+
+  return {
+    windowSize: recentWindow.length,
+    avgFeeling,
+    topRegion: topRegion ? topRegion[0] : null,
+    topRegionCount: topRegion ? topRegion[1] : 0,
+  };
+}
+
+// The Insight Engine: synthesizes patterns across Daily Check-Ins and
+// recorded sessions that neither data source reveals on its own. This is
+// the app's fusion feature -- Movement Overview and Trend Engine only ever
+// look at recorded sessions, and a check-in on its own is just a log. This
+// is the one place the two get cross-referenced.
+function getInsights(sessions: SavedSession[], checkIns: DailyCheckIn[]): Insight[] {
+  const insights: Insight[] = [];
+
+  const streak = getCheckInStreak(checkIns);
+  if (streak >= 3) {
+    insights.push({
+      id: 'streak',
+      kind: 'streak',
+      tone: 'positive',
+      headline: `${streak}-day check-in streak`,
+      detail: `You've logged how you're feeling ${streak} days in a row -- no camera needed. Consistent check-ins are what make the patterns below possible at all.`,
+    });
+  }
+
+  const summary = getCheckInSummary(checkIns);
+  if (summary && summary.windowSize >= 3) {
+    if (summary.topRegion && summary.topRegionCount >= 2) {
+      const isRecurring = summary.topRegionCount >= Math.ceil(summary.windowSize / 2);
+      insights.push({
+        id: 'checkin-region',
+        kind: 'checkin_trend',
+        tone: isRecurring ? 'watch' : 'info',
+        headline: `${summary.topRegion} soreness reported ${summary.topRegionCount} of your last ${summary.windowSize} check-ins`,
+        detail: isRecurring
+          ? "That's a recurring pattern -- worth mentioning to a coach, trainer, or physical therapist if it continues."
+          : 'Keep checking in -- one more report of the same area would make this worth a closer look.',
+      });
+    }
+
+    if (summary.avgFeeling <= 2.4) {
+      insights.push({
+        id: 'checkin-feeling-low',
+        kind: 'checkin_trend',
+        tone: 'watch',
+        headline: 'Your recent check-ins skew low',
+        detail: `Average feeling across your last ${summary.windowSize} check-ins is ${summary.avgFeeling.toFixed(1)}/5. If that continues, consider extra rest or lighter movement checks for a few days.`,
+      });
+    } else if (summary.avgFeeling >= 4.2) {
+      insights.push({
+        id: 'checkin-feeling-high',
+        kind: 'checkin_trend',
+        tone: 'positive',
+        headline: 'Recent check-ins are trending well',
+        detail: `Average feeling across your last ${summary.windowSize} check-ins is ${summary.avgFeeling.toFixed(1)}/5.`,
+      });
+    }
+  }
+
+  // Soreness <-> objective score correlation. Only fires with a genuinely
+  // comparable sample on both sides (>=2 "sore" checks and >=2 "clear"
+  // checks for the same task) so this stays evidence-based, not a guess
+  // from a single data point.
+  (Object.keys(TASK_RELEVANT_REGIONS) as DailyTask[]).forEach((task) => {
+    const relevantRegions = TASK_RELEVANT_REGIONS[task];
+    const taskSessions = getSavedSessionsForTask(sessions, task).filter(
+      (s) => s.primary_score !== null
+    );
+    if (taskSessions.length < 3) return;
+
+    const soreGroup: { score: number; regions: SorenessRegion[] }[] = [];
+    const clearScores: number[] = [];
+
+    taskSessions.forEach((session) => {
+      const sessionTime = new Date(session.timestamp).getTime();
+      const nearbyCheckIn = checkIns.find(
+        (c) => Math.abs(new Date(c.timestamp).getTime() - sessionTime) <= 36 * 60 * 60 * 1000
+      );
+      if (!nearbyCheckIn) return;
+
+      const matchedRegions = nearbyCheckIn.soreness.filter((r) =>
+        relevantRegions.includes(r)
+      );
+      if (matchedRegions.length > 0) {
+        soreGroup.push({ score: session.primary_score as number, regions: matchedRegions });
+      } else {
+        clearScores.push(session.primary_score as number);
+      }
+    });
+
+    if (soreGroup.length < 2 || clearScores.length < 2) return;
+
+    const avgSore = soreGroup.reduce((sum, g) => sum + g.score, 0) / soreGroup.length;
+    const avgClear = clearScores.reduce((sum, s) => sum + s, 0) / clearScores.length;
+    const diff = avgClear - avgSore;
+    if (diff < 8) return;
+
+    const regionCounts: Partial<Record<SorenessRegion, number>> = {};
+    soreGroup.forEach((g) =>
+      g.regions.forEach((r) => {
+        regionCounts[r] = (regionCounts[r] ?? 0) + 1;
+      })
+    );
+    const topRegions = (Object.entries(regionCounts) as [SorenessRegion, number][])
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 2)
+      .map(([r]) => r);
+
+    insights.push({
+      id: `correlation-${task}`,
+      kind: 'correlation',
+      tone: 'watch',
+      headline: `${getDailyTaskLabel(task)} scores are lower on ${topRegions.join(' / ')} days`,
+      detail: `On days you reported ${topRegions.join(' or ')} soreness, ${getDailyTaskLabel(task)} averaged ${avgSore.toFixed(0)}/100 vs ${avgClear.toFixed(0)}/100 otherwise (${soreGroup.length} vs ${clearScores.length} checks compared). Worth mentioning if the pattern continues.`,
+    });
+  });
+
+  // Left/right asymmetry -- purely from recorded sessions, no check-in data
+  // needed. Only fires with >=2 scored sessions on each side for the task.
+  getCoreDailyTasks().forEach((task) => {
+    const taskSessions = getSavedSessionsForTask(sessions, task).filter(
+      (s) => s.primary_score !== null && s.side
+    );
+    const rightScores = taskSessions
+      .filter((s) => s.side === 'right')
+      .map((s) => s.primary_score as number);
+    const leftScores = taskSessions
+      .filter((s) => s.side === 'left')
+      .map((s) => s.primary_score as number);
+    if (rightScores.length < 2 || leftScores.length < 2) return;
+
+    const avgRight = rightScores.reduce((a, b) => a + b, 0) / rightScores.length;
+    const avgLeft = leftScores.reduce((a, b) => a + b, 0) / leftScores.length;
+    const diff = Math.abs(avgRight - avgLeft);
+    if (diff < 15) return;
+
+    const strongerSide = avgRight > avgLeft ? 'right' : 'left';
+    const weakerSide = strongerSide === 'right' ? 'left' : 'right';
+    const strongerAvg = Math.max(avgRight, avgLeft);
+    const weakerAvg = Math.min(avgRight, avgLeft);
+
+    insights.push({
+      id: `asymmetry-${task}`,
+      kind: 'asymmetry',
+      tone: 'watch',
+      headline: `${getDailyTaskLabel(task)}: ${strongerSide} side outperforming ${weakerSide} by ${Math.round(diff)} points`,
+      detail: `Your ${strongerSide} side averages ${strongerAvg.toFixed(0)}/100 on ${getDailyTaskLabel(task)} vs ${weakerAvg.toFixed(0)}/100 on your ${weakerSide}. A persistent gap between sides can be worth a closer look.`,
+    });
+  });
+
+  return insights;
+}
+
+function getInsightToneColors(tone: Insight['tone']) {
+  if (tone === 'positive') {
+    return {
+      bg: 'rgba(21, 128, 61, 0.18)',
+      border: 'rgba(34, 197, 94, 0.45)',
+      text: '#86efac',
+    };
+  }
+  if (tone === 'watch') {
+    return {
+      bg: 'rgba(180, 83, 9, 0.18)',
+      border: 'rgba(251, 191, 36, 0.45)',
+      text: '#fcd34d',
+    };
+  }
+  return {
+    bg: 'rgba(91, 33, 182, 0.18)',
+    border: 'rgba(167, 139, 250, 0.45)',
+    text: '#c4b5fd',
+  };
+}
+
 function getLongitudinalTrendEngine(sessions: SavedSession[]) {
   const tasks = getCoreDailyTasks();
   const taskTrends = tasks.map((task) => getTaskLongitudinalTrend(sessions, task));
@@ -5797,6 +6140,18 @@ export default function HomeScreen() {
   const [showMobilityProfile, setShowMobilityProfile] = useState(false);
   const [showTrendEngine, setShowTrendEngine] = useState(false);
   const [showGuidedOnboarding, setShowGuidedOnboarding] = useState(false);
+
+  // ----- Daily Check-In + Insight Engine -----------------------------------
+  // Fully local, no-camera, no-network state. `checkInDraftFeeling` and
+  // `checkInDraftSoreness` hold the in-progress form before it's saved.
+  const [checkIns, setCheckIns] = useState<DailyCheckIn[]>([]);
+  const [showDailyCheckIn, setShowDailyCheckIn] = useState(false);
+  const [showInsights, setShowInsights] = useState(false);
+  const [checkInDraftFeeling, setCheckInDraftFeeling] = useState<1 | 2 | 3 | 4 | 5>(3);
+  const [checkInDraftSoreness, setCheckInDraftSoreness] = useState<SorenessRegion[]>([]);
+  const [checkInDraftNote, setCheckInDraftNote] = useState('');
+  const [checkInSavedMessage, setCheckInSavedMessage] = useState<string | null>(null);
+
   const [testerNotes, setTesterNotes] = useState<TesterNote[]>([]);
   const [testerName, setTesterName] = useState('');
   const [confusionPoint, setConfusionPoint] = useState('');
@@ -5835,6 +6190,68 @@ export default function HomeScreen() {
     } catch (error) {
       console.log('Failed to load saved sessions:', error);
     }
+  };
+
+  const loadCheckIns = async () => {
+    try {
+      const raw = await AsyncStorage.getItem('daily_checkins_v1');
+      const parsed = raw ? JSON.parse(raw) : [];
+      setCheckIns(Array.isArray(parsed) ? parsed : []);
+    } catch (error) {
+      console.log('Failed to load daily check-ins:', error);
+    }
+  };
+
+  // Saves (or, if one already exists for today, overwrites) today's check-in.
+  // One check-in per calendar day keeps the data model simple and matches
+  // how the feature is framed to the user -- a daily log, not a diary.
+  const saveCheckIn = async (feeling: 1 | 2 | 3 | 4 | 5, soreness: SorenessRegion[], note: string) => {
+    const existingToday = getTodayCheckIn(checkIns);
+    const entry: DailyCheckIn = {
+      id: existingToday?.id ?? `checkin_${Date.now()}`,
+      timestamp: existingToday?.timestamp ?? new Date().toISOString(),
+      feeling,
+      soreness,
+      note: note.trim() ? note.trim().slice(0, 200) : undefined,
+    };
+
+    const updated = existingToday
+      ? checkIns.map((c) => (c.id === entry.id ? entry : c))
+      : [...checkIns, entry];
+
+    setCheckIns(updated);
+    try {
+      await AsyncStorage.setItem('daily_checkins_v1', JSON.stringify(updated));
+    } catch (error) {
+      console.log('Failed to save daily check-in:', error);
+    }
+  };
+
+  const clearCheckIns = async () => {
+    setCheckIns([]);
+    try {
+      await AsyncStorage.removeItem('daily_checkins_v1');
+    } catch (error) {
+      console.log('Failed to clear daily check-ins:', error);
+    }
+  };
+
+  // Opens the Daily Check-In screen, pre-filling the draft with today's
+  // entry if one already exists so re-opening it to tweak an answer doesn't
+  // silently reset the other fields back to defaults.
+  const openDailyCheckIn = () => {
+    const existing = getTodayCheckIn(checkIns);
+    if (existing) {
+      setCheckInDraftFeeling(existing.feeling);
+      setCheckInDraftSoreness(existing.soreness);
+      setCheckInDraftNote(existing.note ?? '');
+    } else {
+      setCheckInDraftFeeling(3);
+      setCheckInDraftSoreness([]);
+      setCheckInDraftNote('');
+    }
+    setCheckInSavedMessage(null);
+    setShowDailyCheckIn(true);
   };
 
   // Phase 2: load any previously-confirmed calibration for either arm so it
@@ -6442,6 +6859,7 @@ export default function HomeScreen() {
     loadCalibration();
     loadReminderSettings();
     loadWhatsNewStatus();
+    loadCheckIns();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [requestPermission]);
 
@@ -9013,6 +9431,212 @@ export default function HomeScreen() {
           style={styles.mainButton}
           onPress={() => setShowDailyHealthOverview(false)}
         >
+          <Text style={styles.buttonText}>Back Home</Text>
+        </Pressable>
+      </ScrollView>
+    );
+  }
+
+  if (showDailyCheckIn) {
+    const todayCheckIn = getTodayCheckIn(checkIns);
+
+    return (
+      <ScrollView
+        style={styles.homeScroll}
+        contentContainerStyle={styles.checkInContent}
+        showsVerticalScrollIndicator={false}
+      >
+        <View style={styles.heroBadge}>
+          <Text style={styles.heroBadgeText}>Daily Check-In</Text>
+        </View>
+
+        <Text style={styles.title}>How Are You Feeling Today?</Text>
+
+        <Text style={styles.subtitle}>
+          No camera, no recording -- just a couple of taps. Takes under 30 seconds and helps the Insights screen spot real patterns over time.
+        </Text>
+
+        <View style={styles.checkInCard}>
+          <Text style={styles.inputLabel}>Overall feeling</Text>
+          <View style={styles.checkInFeelingRow}>
+            {([1, 2, 3, 4, 5] as const).map((level) => (
+              <Pressable
+                key={level}
+                style={[
+                  styles.checkInFeelingChip,
+                  checkInDraftFeeling === level && styles.checkInFeelingChipActive,
+                ]}
+                onPress={() => setCheckInDraftFeeling(level)}
+              >
+                <Text
+                  style={[
+                    styles.checkInFeelingChipText,
+                    checkInDraftFeeling === level && styles.checkInFeelingChipTextActive,
+                  ]}
+                >
+                  {FEELING_LABELS[level]}
+                </Text>
+              </Pressable>
+            ))}
+          </View>
+
+          <Text style={[styles.inputLabel, styles.checkInSectionSpacing]}>
+            Any soreness today? (optional -- tap all that apply)
+          </Text>
+          <View style={styles.checkInSorenessRow}>
+            {SORENESS_REGIONS.map((region) => {
+              const active = checkInDraftSoreness.includes(region);
+              return (
+                <Pressable
+                  key={region}
+                  style={[
+                    styles.checkInSorenessChip,
+                    active && styles.checkInSorenessChipActive,
+                  ]}
+                  onPress={() => {
+                    setCheckInDraftSoreness((prev) =>
+                      prev.includes(region)
+                        ? prev.filter((r) => r !== region)
+                        : [...prev, region]
+                    );
+                  }}
+                >
+                  <Text
+                    style={[
+                      styles.checkInSorenessChipText,
+                      active && styles.checkInSorenessChipTextActive,
+                    ]}
+                  >
+                    {region}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </View>
+
+          <Text style={[styles.inputLabel, styles.checkInSectionSpacing]}>
+            Anything else? (optional)
+          </Text>
+          <TextInput
+            style={styles.feedbackInput}
+            value={checkInDraftNote}
+            onChangeText={setCheckInDraftNote}
+            placeholder="Example: slept badly, tight hamstrings from yesterday"
+            placeholderTextColor="#64748b"
+          />
+
+          <Pressable
+            style={styles.checkInSaveButton}
+            onPress={async () => {
+              await saveCheckIn(checkInDraftFeeling, checkInDraftSoreness, checkInDraftNote);
+              setCheckInSavedMessage("Saved today's check-in.");
+            }}
+          >
+            <Text style={styles.buttonText}>
+              {todayCheckIn ? "Update Today's Check-In" : 'Save Check-In'}
+            </Text>
+          </Pressable>
+
+          {checkInSavedMessage ? (
+            <Text style={styles.checkInSavedMessage}>{checkInSavedMessage}</Text>
+          ) : null}
+        </View>
+
+        {checkIns.length >= 2 ? (
+          <Pressable
+            style={styles.secondaryButton}
+            onPress={() => {
+              setShowDailyCheckIn(false);
+              setShowInsights(true);
+            }}
+          >
+            <Text style={styles.secondaryButtonText}>View Insights</Text>
+          </Pressable>
+        ) : null}
+
+        <Pressable
+          style={styles.mainButton}
+          onPress={() => {
+            setShowDailyCheckIn(false);
+            setCheckInSavedMessage(null);
+          }}
+        >
+          <Text style={styles.buttonText}>Back Home</Text>
+        </Pressable>
+
+        {checkIns.length > 0 ? (
+          <Pressable style={styles.clearHistoryButton} onPress={clearCheckIns}>
+            <Text style={styles.clearHistoryButtonText}>Clear Check-In History</Text>
+          </Pressable>
+        ) : null}
+      </ScrollView>
+    );
+  }
+
+  if (showInsights) {
+    const insights = getInsights(savedSessions, checkIns);
+
+    return (
+      <ScrollView
+        style={styles.homeScroll}
+        contentContainerStyle={styles.checkInContent}
+        showsVerticalScrollIndicator={false}
+      >
+        <View style={styles.heroBadge}>
+          <Text style={styles.heroBadgeText}>Insights</Text>
+        </View>
+
+        <Text style={styles.title}>Your Insights</Text>
+
+        <Text style={styles.subtitle}>
+          Patterns found by combining your Daily Check-Ins with your recorded movement checks -- all computed on your device, nothing sent anywhere.
+        </Text>
+
+        {checkIns.length === 0 ? (
+          <View style={styles.checkInCard}>
+            <Text style={styles.emptyPublicHomeTitle}>No Check-Ins Yet</Text>
+            <Text style={styles.emptyPublicHomeText}>
+              Log a Daily Check-In for a few days -- no camera needed -- and this screen will start surfacing patterns: energy trends, recurring soreness, and how your recorded scores relate to how you&apos;ve been feeling.
+            </Text>
+            <Pressable style={styles.startHereCardButton} onPress={openDailyCheckIn}>
+              <Text style={styles.buttonText}>Do Today&apos;s Check-In</Text>
+            </Pressable>
+          </View>
+        ) : insights.length === 0 ? (
+          <View style={styles.checkInCard}>
+            <Text style={styles.emptyPublicHomeTitle}>Not Enough Data Yet</Text>
+            <Text style={styles.emptyPublicHomeText}>
+              You&apos;ve logged {checkIns.length} check-in{checkIns.length === 1 ? '' : 's'}. Keep checking in daily
+              {savedSessions.length > 0 ? ' and recording movement checks' : ''} -- patterns need a few days of data before they&apos;re reliable enough to show.
+            </Text>
+          </View>
+        ) : (
+          insights.map((insight) => {
+            const toneColors = getInsightToneColors(insight.tone);
+            return (
+              <View
+                key={insight.id}
+                style={[
+                  styles.insightCard,
+                  { backgroundColor: toneColors.bg, borderColor: toneColors.border },
+                ]}
+              >
+                <Text style={[styles.insightHeadline, { color: toneColors.text }]}>
+                  {insight.headline}
+                </Text>
+                <Text style={styles.insightDetail}>{insight.detail}</Text>
+              </View>
+            );
+          })
+        )}
+
+        <Pressable style={styles.secondaryButton} onPress={openDailyCheckIn}>
+          <Text style={styles.secondaryButtonText}>
+            {hasCheckedInToday(checkIns) ? "Update Today's Check-In" : "Do Today's Check-In"}
+          </Text>
+        </Pressable>
+
+        <Pressable style={styles.mainButton} onPress={() => setShowInsights(false)}>
           <Text style={styles.buttonText}>Back Home</Text>
         </Pressable>
       </ScrollView>
@@ -11682,6 +12306,25 @@ export default function HomeScreen() {
             </Pressable>
 
             <Pressable
+              style={[styles.howItWorksButton, { position: 'relative' }]}
+              onPress={openDailyCheckIn}
+              accessibilityRole="button"
+              accessibilityLabel="Daily Check-In"
+            >
+              <Text style={styles.howItWorksButtonText}>Check-In</Text>
+              {!hasCheckedInToday(checkIns) ? (
+                <View style={styles.unreadDot} />
+              ) : null}
+            </Pressable>
+
+            <Pressable
+              style={styles.howItWorksButton}
+              onPress={() => setShowInsights(true)}
+            >
+              <Text style={styles.howItWorksButtonText}>Insights</Text>
+            </Pressable>
+
+            <Pressable
               style={styles.reportTopButton}
               onPress={() => setShowReportExport(true)}
             >
@@ -11734,6 +12377,37 @@ export default function HomeScreen() {
           <Text style={styles.subtitle}>
             {APP_TAGLINE} Record a short movement check and get a clear score, confidence level, trend, and next action.
           </Text>
+
+          <View style={styles.checkInHomeCard}>
+            <Text style={styles.checkInHomeCardTitle}>
+              {hasCheckedInToday(checkIns) ? "Today's Check-In Done" : 'Quick Daily Check-In'}
+            </Text>
+            <Text style={styles.checkInHomeCardText}>
+              {hasCheckedInToday(checkIns)
+                ? `You logged feeling "${FEELING_LABELS[getTodayCheckIn(checkIns)!.feeling]}" today. Update it anytime.`
+                : "No camera needed -- just log how you feel. Takes under 30 seconds, and it's the easiest way to start tracking if you don't want to record a full movement check every day."}
+            </Text>
+            {getCheckInStreak(checkIns) >= 2 ? (
+              <Text style={styles.checkInHomeStreak}>
+                {getCheckInStreak(checkIns)}-day check-in streak
+              </Text>
+            ) : null}
+            <View style={styles.checkInHomeButtonRow}>
+              <Pressable style={styles.checkInHomeButton} onPress={openDailyCheckIn}>
+                <Text style={styles.buttonText}>
+                  {hasCheckedInToday(checkIns) ? 'Update Check-In' : 'Check In Now'}
+                </Text>
+              </Pressable>
+              {checkIns.length >= 2 ? (
+                <Pressable
+                  style={styles.checkInHomeSecondaryButton}
+                  onPress={() => setShowInsights(true)}
+                >
+                  <Text style={styles.secondaryButtonText}>Insights</Text>
+                </Pressable>
+              ) : null}
+            </View>
+          </View>
 
           <View style={styles.startHereCard}>
             <Text style={styles.startHereCardTitle}>New here?</Text>
@@ -17512,6 +18186,184 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     borderRadius: 999,
     alignItems: 'center',
+  },
+
+  // ----- Daily Check-In + Insights ------------------------------------------
+  checkInContent: {
+    flexGrow: 1,
+    alignItems: 'center',
+    padding: 24,
+    paddingTop: 48,
+    paddingBottom: 48,
+    backgroundColor: '#0f172a',
+  },
+
+  checkInHomeCard: {
+    width: '100%',
+    backgroundColor: 'rgba(91, 33, 182, 0.16)',
+    borderWidth: 1,
+    borderColor: 'rgba(167, 139, 250, 0.28)',
+    borderRadius: 20,
+    padding: 16,
+    marginBottom: 16,
+  },
+
+  checkInHomeCardTitle: {
+    color: '#ffffff',
+    fontSize: 20,
+    fontWeight: '900',
+    marginBottom: 6,
+  },
+
+  checkInHomeCardText: {
+    color: '#ddd6fe',
+    fontSize: 14,
+    lineHeight: 20,
+    marginBottom: 8,
+  },
+
+  checkInHomeStreak: {
+    color: '#c4b5fd',
+    fontSize: 12,
+    fontWeight: '800',
+    marginBottom: 10,
+  },
+
+  checkInHomeButtonRow: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+
+  checkInHomeButton: {
+    flex: 1,
+    backgroundColor: '#7c3aed',
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 999,
+    alignItems: 'center',
+  },
+
+  checkInHomeSecondaryButton: {
+    flex: 1,
+    backgroundColor: 'transparent',
+    borderWidth: 1,
+    borderColor: 'rgba(167, 139, 250, 0.45)',
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 999,
+    alignItems: 'center',
+  },
+
+  checkInCard: {
+    width: '100%',
+    backgroundColor: 'rgba(30, 41, 59, 0.9)',
+    borderWidth: 1,
+    borderColor: 'rgba(148, 163, 184, 0.14)',
+    borderRadius: 18,
+    padding: 16,
+    marginBottom: 16,
+  },
+
+  checkInSectionSpacing: {
+    marginTop: 16,
+  },
+
+  checkInFeelingRow: {
+    flexDirection: 'row',
+    gap: 6,
+  },
+
+  checkInFeelingChip: {
+    flex: 1,
+    backgroundColor: '#334155',
+    paddingVertical: 10,
+    paddingHorizontal: 4,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(148, 163, 184, 0.14)',
+    alignItems: 'center',
+  },
+
+  checkInFeelingChipActive: {
+    backgroundColor: '#7c3aed',
+    borderColor: 'rgba(196, 181, 253, 0.5)',
+  },
+
+  checkInFeelingChipText: {
+    color: '#cbd5e1',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+
+  checkInFeelingChipTextActive: {
+    color: '#ffffff',
+  },
+
+  checkInSorenessRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+
+  checkInSorenessChip: {
+    backgroundColor: '#334155',
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: 'rgba(148, 163, 184, 0.14)',
+  },
+
+  checkInSorenessChipActive: {
+    backgroundColor: 'rgba(180, 83, 9, 0.55)',
+    borderColor: 'rgba(251, 191, 36, 0.5)',
+  },
+
+  checkInSorenessChipText: {
+    color: '#cbd5e1',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+
+  checkInSorenessChipTextActive: {
+    color: '#ffffff',
+  },
+
+  checkInSaveButton: {
+    backgroundColor: '#7c3aed',
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 999,
+    alignItems: 'center',
+    marginTop: 18,
+  },
+
+  checkInSavedMessage: {
+    color: '#86efac',
+    fontSize: 13,
+    fontWeight: '700',
+    textAlign: 'center',
+    marginTop: 10,
+  },
+
+  insightCard: {
+    width: '100%',
+    borderWidth: 1,
+    borderRadius: 16,
+    padding: 14,
+    marginBottom: 12,
+  },
+
+  insightHeadline: {
+    fontSize: 15,
+    fontWeight: '800',
+    marginBottom: 6,
+  },
+
+  insightDetail: {
+    color: '#cbd5e1',
+    fontSize: 13,
+    lineHeight: 19,
   },
 
   guidedOnboardingContent: {

@@ -57,3 +57,5 @@ env/
 /test-results/
 /playwright-report/
 /blob-report/
+node_modules_broken_backup/
+.claude/
