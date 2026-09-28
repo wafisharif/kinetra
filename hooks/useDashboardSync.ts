@@ -31,7 +31,16 @@ import { API_BASE_URL } from '@/constants/apiBase';
 const TOKEN_KEY = 'dashboard_sync_token_v1';
 const USER_KEY = 'dashboard_sync_user_v1';
 
-const REQUEST_TIMEOUT_MS = 20000;
+// Matches the web dashboard's own REQUEST_TIMEOUT_MS (js/dashboard.js in
+// the kinetra-website repo) -- both talk to the same Render free-tier
+// backend, which spins an idle instance down and can take 20-50s to wake
+// back up on the first request after a quiet period (longer than most
+// Render apps, since this one's cold start also has to import mediapipe/
+// opencv/numpy before Flask can even start handling requests). A shorter
+// timeout here was the actual bug behind "sign-in never works from another
+// device" reports: the app was giving up well before a cold backend had
+// even finished waking, on every single first attempt.
+const REQUEST_TIMEOUT_MS = 45000;
 
 export type DashboardUser = { id: string; name: string; email: string };
 
@@ -66,7 +75,7 @@ async function apiRequest(
   } catch (error: any) {
     if (error?.name === 'AbortError') {
       throw new ApiError(
-        'The Kinetra server is taking too long to respond. It may be waking up from being idle -- try again in a moment.'
+        'The Kinetra server is taking too long to respond. It\'s probably waking up from being idle -- this can take up to a minute the first time. Wait a bit and try again.'
       );
     }
     throw new ApiError(`Could not reach the Kinetra server at ${API_BASE_URL}.`);

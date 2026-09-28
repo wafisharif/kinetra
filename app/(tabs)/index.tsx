@@ -6136,6 +6136,13 @@ export default function HomeScreen() {
   const [dashboardName, setDashboardName] = useState('');
   const [dashboardEmail, setDashboardEmail] = useState('');
   const [dashboardPassword, setDashboardPassword] = useState('');
+  // Flips to true 6s into a sign-in/sign-up call that's still pending --
+  // matches the same threshold and wording as the web dashboard's own
+  // "Still working, waking up the server..." notice (js/dashboard.js),
+  // since both hit the exact same Render free-tier backend and its cold
+  // start can take up to a minute. Without this, a long-but-successful
+  // wait just looks like the button is frozen.
+  const [dashboardAuthSlow, setDashboardAuthSlow] = useState(false);
 
   // Fires once, right when a sign-in/sign-up succeeds, so whatever is
   // already on this device shows up on the web dashboard immediately
@@ -8104,19 +8111,30 @@ export default function HomeScreen() {
                 ]}
                 disabled={dashboardSync.authBusy}
                 onPress={async () => {
-                  if (dashboardAuthMode === 'signup') {
-                    await dashboardSync.signUp(dashboardName, dashboardEmail, dashboardPassword);
-                  } else {
-                    await dashboardSync.signIn(dashboardEmail, dashboardPassword);
+                  setDashboardAuthSlow(false);
+                  const slowTimer = setTimeout(() => setDashboardAuthSlow(true), 6000);
+                  try {
+                    if (dashboardAuthMode === 'signup') {
+                      await dashboardSync.signUp(dashboardName, dashboardEmail, dashboardPassword);
+                    } else {
+                      await dashboardSync.signIn(dashboardEmail, dashboardPassword);
+                    }
+                    setDashboardPassword('');
+                  } finally {
+                    clearTimeout(slowTimer);
+                    setDashboardAuthSlow(false);
                   }
-                  setDashboardPassword('');
                 }}
               >
                 {dashboardSync.authBusy ? (
                   <ActivityIndicator size="small" color="#ffffff" style={{ marginRight: 8 }} />
                 ) : null}
                 <Text style={styles.buttonText}>
-                  {dashboardAuthMode === 'signup' ? 'Create Account' : 'Sign In'}
+                  {dashboardSync.authBusy && dashboardAuthSlow
+                    ? 'Still working, waking up the server…'
+                    : dashboardAuthMode === 'signup'
+                    ? 'Create Account'
+                    : 'Sign In'}
                 </Text>
               </Pressable>
             </>
