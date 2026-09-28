@@ -28,6 +28,12 @@
 # don't half-upgrade.
 Flask==3.1.3
 flask-cors==6.0.5
+# Explicit pin for itsdangerous (Flask's own token/session signing dep,
+# otherwise resolved transitively). Pinned explicitly because
+# accounts.py uses it directly for dashboard auth tokens, and this repo's
+# convention is to pin what's imported directly rather than rely on a
+# transitive version nobody chose on purpose.
+itsdangerous==2.2.0
 gunicorn==26.2.0
 # Bumped from 2.32.3 (2026-09-15) to pick up two published security fixes
 # (pip-audit: PYSEC-2026-1872, PYSEC-2026-2275). requests has an excellent

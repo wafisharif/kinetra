@@ -10,9 +10,16 @@ from pathlib import Path
 import requests
 
 from pose_test import run_analysis
+from accounts import accounts_bp, init_db
 
 app = Flask(__name__)
 CORS(app)
+
+# Web dashboard accounts (signup/login/me) -- see accounts.py for the full
+# design rationale. Registered as a blueprint so the routes live in their
+# own module, testable without mediapipe/opencv in the import path.
+init_db()
+app.register_blueprint(accounts_bp)
 
 # Trust exactly one reverse-proxy hop for client-IP resolution. Render,
 # Railway, Fly.io, and Heroku-style PaaS hosts all put exactly one proxy
