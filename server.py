@@ -11,6 +11,7 @@ import requests
 
 from pose_test import run_analysis
 from accounts import accounts_bp, init_db
+from sync import sync_bp, init_sync_db
 
 app = Flask(__name__)
 CORS(app)
@@ -20,6 +21,14 @@ CORS(app)
 # own module, testable without mediapipe/opencv in the import path.
 init_db()
 app.register_blueprint(accounts_bp)
+
+# Web dashboard data sync (the mobile app pushing its local sessions/
+# check-ins/calibration up for the browser dashboard to read) -- see sync.py
+# for the full design rationale. Same registration pattern as accounts_bp
+# above; sync.py reuses accounts.py's token verification directly rather
+# than its own auth.
+init_sync_db()
+app.register_blueprint(sync_bp)
 
 # Trust exactly one reverse-proxy hop for client-IP resolution. Render,
 # Railway, Fly.io, and Heroku-style PaaS hosts all put exactly one proxy

@@ -20,6 +20,9 @@ import {
 } from 'react-native';
 import Svg, { Circle, Line } from 'react-native-svg';
 
+import { useDashboardSync } from '@/hooks/useDashboardSync';
+import { API_BASE_URL } from '@/constants/apiBase';
+
 // Local (on-device, no server) daily reminder notification. Foreground
 // behavior only matters if the app happens to be open when the reminder
 // fires -- still show it as a banner/list entry so it's not silently
@@ -35,33 +38,10 @@ Notifications.setNotificationHandler({
 
 const REMINDER_NOTIFICATION_IDENTIFIER = 'kinetra-daily-reminder';
 
-// Backend URLs are config-driven via environment variables (see `.env` /
-// `.env.example` at the project root) instead of being hardcoded here. Expo
-// automatically loads `.env` and inlines any `EXPO_PUBLIC_`-prefixed variable
-// into the JS bundle at build/export time -- this is the standard Expo
-// mechanism for build-time config that isn't secret (the value ends up
-// visible in the client bundle either way, exactly like a hardcoded string
-// would). This means rotating a backend host (e.g. replacing an expiring
-// ngrok URL, or pointing a preview build at a staging server) is a one-line
-// edit to `.env`, never a source-code change to this 17,000-line file.
-//
-// The literal strings below are fallbacks only, used if `.env` is ever
-// missing -- they keep local development working out of the box but should
-// not be relied on for anything shipped.
-const LOCAL_API_BASE_URL = process.env.EXPO_PUBLIC_LOCAL_API_BASE_URL || 'http://192.168.1.163:5000';
-
-// ⚠️  The fallback below is an ngrok free-tier URL and WILL EXPIRE. Set
-// EXPO_PUBLIC_DEPLOYED_API_BASE_URL in `.env` to your real deployed backend
-// URL (Render, Railway, Fly.io, your own server, etc.) before shipping a
-// production or preview build.
-const DEPLOYED_API_BASE_URL = process.env.EXPO_PUBLIC_DEPLOYED_API_BASE_URL || 'https://unrest-busily-snort.ngrok-free.dev';
-
-// __DEV__ is a React Native global: true in a development build, false in a
-// production/release build. This used to be
-// `DEPLOYED_API_BASE_URL || LOCAL_API_BASE_URL`, which ALWAYS picked the
-// deployed URL -- a non-empty string is always truthy, so LOCAL_API_BASE_URL
-// could never actually be reached, even when developing locally.
-const API_BASE_URL = __DEV__ ? LOCAL_API_BASE_URL : DEPLOYED_API_BASE_URL;
+// Backend base URL now lives in constants/apiBase.ts, shared with
+// hooks/useDashboardSync.ts (which needs the exact same host for its
+// /auth and /sync calls). See that file for the full explanation of the
+// env-var-driven setup; API_BASE_URL below is that same value, imported.
 
 const ANALYSIS_TIMEOUT_MS = 90000;
 const SERVER_HEALTH_TIMEOUT_MS = 8000;
@@ -6145,6 +6125,34 @@ export default function HomeScreen() {
   // Fully local, no-camera, no-network state. `checkInDraftFeeling` and
   // `checkInDraftSoreness` hold the in-progress form before it's saved.
   const [checkIns, setCheckIns] = useState<DailyCheckIn[]>([]);
+
+  // ----- Web Dashboard Sync (optional) -------------------------------------
+  // See hooks/useDashboardSync.ts for the full explanation. Signing in here
+  // is unrelated to the rest of the app's state -- it only reads
+  // savedSessions/checkIns/calibratedThresholdsBySide to push copies of
+  // them out, never the other way around.
+  const dashboardSync = useDashboardSync();
+  const [dashboardAuthMode, setDashboardAuthMode] = useState<'signin' | 'signup'>('signin');
+  const [dashboardName, setDashboardName] = useState('');
+  const [dashboardEmail, setDashboardEmail] = useState('');
+  const [dashboardPassword, setDashboardPassword] = useState('');
+
+  // Fires once, right when a sign-in/sign-up succeeds, so whatever is
+  // already on this device shows up on the web dashboard immediately
+  // instead of waiting for the next session, check-in, or calibration
+  // change. Deliberately keyed on dashboardSync.user (identity, not
+  // contents) so it does not re-fire on every local data change -- the
+  // save-site calls below (saveAnalysisSession, saveCheckIn,
+  // persistCalibrationForSide) already handle those.
+  useEffect(() => {
+    if (!dashboardSync.user) return;
+    dashboardSync.syncNow({
+      sessions: savedSessions,
+      checkIns,
+      calibration: calibratedThresholdsBySide,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dashboardSync.user]);
   const [showDailyCheckIn, setShowDailyCheckIn] = useState(false);
   const [showInsights, setShowInsights] = useState(false);
   const [checkInDraftFeeling, setCheckInDraftFeeling] = useState<1 | 2 | 3 | 4 | 5>(3);
@@ -6222,6 +6230,15 @@ export default function HomeScreen() {
     setCheckIns(updated);
     try {
       await AsyncStorage.setItem('daily_checkins_v1', JSON.stringify(updated));
+      // Best-effort push to the web dashboard -- silently a no-op when
+      // signed out (see hooks/useDashboardSync.ts). Never awaited into the
+      // check-in flow's error handling below; a sync hiccup should never
+      // look like the check-in itself failed to save.
+      dashboardSync.syncNow({
+        sessions: savedSessions,
+        checkIns: updated,
+        calibration: calibratedThresholdsBySide,
+      });
     } catch (error) {
       console.log('Failed to save daily check-in:', error);
     }
@@ -6291,6 +6308,11 @@ export default function HomeScreen() {
     setCalibratedThresholdsBySide(updated);
     try {
       await AsyncStorage.setItem('calibrated_thresholds_v1', JSON.stringify(updated));
+      dashboardSync.syncNow({
+        sessions: savedSessions,
+        checkIns,
+        calibration: updated,
+      });
     } catch (error) {
       console.log('Failed to save calibration:', error);
     }
@@ -6464,6 +6486,11 @@ export default function HomeScreen() {
         'movement_sessions_v1',
         JSON.stringify(updatedSessions)
       );
+      dashboardSync.syncNow({
+        sessions: updatedSessions,
+        checkIns,
+        calibration: calibratedThresholdsBySide,
+      });
 
       // A new session just became "the latest" -- clear any AI Coach note
       // from a previous session so it can't be mistaken for feedback on
@@ -7920,6 +7947,180 @@ export default function HomeScreen() {
               <Text style={styles.secondaryButtonText}>Reset Both to Default Range</Text>
             </Pressable>
           ) : null}
+        </View>
+
+        <View style={styles.cameraSetupCard}>
+          <Text style={styles.sectionTitle}>Web Dashboard Sync</Text>
+          {dashboardSync.authLoading ? (
+            <ActivityIndicator size="small" color="#93c5fd" style={{ marginTop: 10 }} />
+          ) : dashboardSync.user ? (
+            <>
+              <Text style={styles.dailyTaskDescription}>
+                Signed in as {dashboardSync.user.name} ({dashboardSync.user.email}).{'\n'}
+                Your sessions, check-ins, and calibration sync to kinetraapp.com/dashboard.
+              </Text>
+              <Text
+                style={[
+                  styles.dailyTaskDescription,
+                  { marginTop: 8 },
+                  dashboardSync.syncStatus === 'error' ? { color: '#fecaca' } : null,
+                  dashboardSync.syncStatus === 'synced' ? { color: '#86efac' } : null,
+                ]}
+              >
+                {dashboardSync.syncStatus === 'syncing'
+                  ? 'Syncing…'
+                  : dashboardSync.syncStatus === 'error'
+                  ? `Sync failed: ${dashboardSync.syncError ?? 'unknown error'}`
+                  : dashboardSync.lastSyncedAt
+                  ? `Last synced ${new Date(dashboardSync.lastSyncedAt).toLocaleString()}`
+                  : 'Not synced yet.'}
+              </Text>
+              <Pressable
+                style={[
+                  styles.secondaryButton,
+                  { marginTop: 12, flexDirection: 'row', justifyContent: 'center', alignItems: 'center' },
+                ]}
+                disabled={dashboardSync.syncStatus === 'syncing'}
+                onPress={() => {
+                  dashboardSync.syncNow({
+                    sessions: savedSessions,
+                    checkIns,
+                    calibration: calibratedThresholdsBySide,
+                  });
+                }}
+              >
+                {dashboardSync.syncStatus === 'syncing' ? (
+                  <ActivityIndicator size="small" color="#cbd5e1" style={{ marginRight: 8 }} />
+                ) : null}
+                <Text style={styles.secondaryButtonText}>Sync Now</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.secondaryButton, { marginTop: 10 }]}
+                onPress={() => {
+                  dashboardSync.signOut();
+                }}
+              >
+                <Text style={styles.secondaryButtonText}>Sign Out</Text>
+              </Pressable>
+            </>
+          ) : (
+            <>
+              <Text style={styles.dailyTaskDescription}>
+                Sign in to see your sessions, check-ins, and calibration on the web dashboard
+                at kinetraapp.com/dashboard from any device. Completely optional.
+              </Text>
+
+              <View style={{ flexDirection: 'row', marginTop: 12, gap: 8 }}>
+                <Pressable
+                  style={[
+                    styles.secondaryButton,
+                    { flex: 1 },
+                    dashboardAuthMode === 'signin' ? { backgroundColor: '#2563eb' } : null,
+                  ]}
+                  onPress={() => {
+                    setDashboardAuthMode('signin');
+                    dashboardSync.clearAuthError();
+                  }}
+                >
+                  <Text
+                    style={[
+                      styles.secondaryButtonText,
+                      dashboardAuthMode === 'signin' ? { color: '#ffffff' } : null,
+                    ]}
+                  >
+                    Sign In
+                  </Text>
+                </Pressable>
+                <Pressable
+                  style={[
+                    styles.secondaryButton,
+                    { flex: 1 },
+                    dashboardAuthMode === 'signup' ? { backgroundColor: '#2563eb' } : null,
+                  ]}
+                  onPress={() => {
+                    setDashboardAuthMode('signup');
+                    dashboardSync.clearAuthError();
+                  }}
+                >
+                  <Text
+                    style={[
+                      styles.secondaryButtonText,
+                      dashboardAuthMode === 'signup' ? { color: '#ffffff' } : null,
+                    ]}
+                  >
+                    Create Account
+                  </Text>
+                </Pressable>
+              </View>
+
+              {dashboardAuthMode === 'signup' ? (
+                <>
+                  <Text style={styles.inputLabel}>Name</Text>
+                  <TextInput
+                    style={styles.feedbackInput}
+                    value={dashboardName}
+                    onChangeText={setDashboardName}
+                    placeholder="Your name"
+                    placeholderTextColor="#64748b"
+                    autoCapitalize="words"
+                  />
+                </>
+              ) : null}
+
+              <Text style={styles.inputLabel}>Email</Text>
+              <TextInput
+                style={styles.feedbackInput}
+                value={dashboardEmail}
+                onChangeText={setDashboardEmail}
+                placeholder="you@example.com"
+                placeholderTextColor="#64748b"
+                autoCapitalize="none"
+                keyboardType="email-address"
+                autoCorrect={false}
+              />
+
+              <Text style={styles.inputLabel}>Password</Text>
+              <TextInput
+                style={styles.feedbackInput}
+                value={dashboardPassword}
+                onChangeText={setDashboardPassword}
+                placeholder={dashboardAuthMode === 'signup' ? 'At least 8 characters' : 'Your password'}
+                placeholderTextColor="#64748b"
+                secureTextEntry
+                autoCapitalize="none"
+              />
+
+              {dashboardSync.authError ? (
+                <View style={[styles.cameraMistakeCard, { marginTop: 12, marginBottom: 0 }]}>
+                  <Text style={styles.cameraMistakeText}>{dashboardSync.authError}</Text>
+                </View>
+              ) : null}
+
+              <Pressable
+                style={[
+                  styles.mainButton,
+                  { marginTop: 12, flexDirection: 'row', justifyContent: 'center', alignItems: 'center' },
+                  dashboardSync.authBusy ? styles.disabledButton : null,
+                ]}
+                disabled={dashboardSync.authBusy}
+                onPress={async () => {
+                  if (dashboardAuthMode === 'signup') {
+                    await dashboardSync.signUp(dashboardName, dashboardEmail, dashboardPassword);
+                  } else {
+                    await dashboardSync.signIn(dashboardEmail, dashboardPassword);
+                  }
+                  setDashboardPassword('');
+                }}
+              >
+                {dashboardSync.authBusy ? (
+                  <ActivityIndicator size="small" color="#ffffff" style={{ marginRight: 8 }} />
+                ) : null}
+                <Text style={styles.buttonText}>
+                  {dashboardAuthMode === 'signup' ? 'Create Account' : 'Sign In'}
+                </Text>
+              </Pressable>
+            </>
+          )}
         </View>
 
         <View style={styles.cameraSetupCard}>
