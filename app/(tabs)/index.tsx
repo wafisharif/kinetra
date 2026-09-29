@@ -47,8 +47,50 @@ const ANALYSIS_TIMEOUT_MS = 90000;
 const SERVER_HEALTH_TIMEOUT_MS = 8000;
 
 const APP_NAME = 'Kinetra';
-const APP_TAGLINE = 'Understand Movement. Move Better.';
+const APP_TAGLINE = 'A simple daily check-in for how you move and how you feel.';
 const APP_BETA_LABEL = 'Beta';
+
+// Redesign: a rotating, general-audience wellness tip shown on the home
+// screen. Deliberately not movement-analysis output -- this is plain,
+// widely-applicable advice that gives the app something for someone who
+// never records a single movement check, so it isn't purely a fitness/rehab
+// tool. Rotates by calendar day (not randomly) so it's stable if you reopen
+// the app several times in one day.
+const GENERAL_WELLNESS_TIPS: { title: string; text: string }[] = [
+  {
+    title: 'Take a movement break',
+    text: "If you've been sitting for a while, standing up and moving for two minutes can ease stiffness -- no workout required.",
+  },
+  {
+    title: 'Check your posture',
+    text: 'Relax your shoulders away from your ears and let your head rest over your spine instead of pushed forward.',
+  },
+  {
+    title: 'Hydration check',
+    text: 'Feeling stiff or low-energy can sometimes just be dehydration. A glass of water is a good first move.',
+  },
+  {
+    title: 'Stretch it out',
+    text: 'A slow 30-second stretch for whatever feels tightest right now -- neck, shoulders, hips, or hamstrings -- adds up over time.',
+  },
+  {
+    title: 'Sleep and movement',
+    text: 'How you slept can change how your body feels today. If today is rough, that is useful context, not a bad score.',
+  },
+  {
+    title: 'Small steps count',
+    text: "A short walk, even just around the room, counts as movement. You don't need a full workout to check in on how you move.",
+  },
+  {
+    title: 'Screen breaks help too',
+    text: 'Long stretches looking at a screen can tighten your neck and shoulders just as much as a hard workout. Look away and roll your shoulders every so often.',
+  },
+];
+
+function getDailyTip(): { title: string; text: string } {
+  const dayIndex = Math.floor(Date.now() / (1000 * 60 * 60 * 24));
+  return GENERAL_WELLNESS_TIPS[dayIndex % GENERAL_WELLNESS_TIPS.length];
+}
 const APP_SAFETY_NOTE =
   'Kinetra is for movement awareness only. It does not diagnose, treat, predict injury, estimate fall risk, or replace medical advice.';
 
@@ -1301,8 +1343,8 @@ function getDailyTaskLabel(task: DailyTask) {
   if (task === 'arm_raise') return 'Arm Raise';
   if (task === 'walking') return 'Walking';
   if (task === 'balance') return 'Balance';
-  if (task === 'timed_up_and_go') return 'Timed Up and Go';
-  return 'Sit-to-Stand';
+  if (task === 'timed_up_and_go') return 'Get Up & Go';
+  return 'Chair Stand';
 }
 
 function getDailyTaskDescription(task: DailyTask) {
@@ -4940,7 +4982,7 @@ function getOnboardingProgress(sessions: SavedSession[]) {
     },
     {
       task: 'sit_to_stand' as DailyTask,
-      label: 'Sit-to-Stand',
+      label: 'Chair Stand',
       reason: 'Starts your lower-body transition profile.',
     },
     {
@@ -4985,7 +5027,7 @@ function getOnboardingProgress(sessions: SavedSession[]) {
     headline = 'Your Starter Mobility Profile Is Ready';
     summary = 'You completed the core setup checks. Now you can review your Mobility Profile and keep building baselines.';
     nextTask = 'timed_up_and_go';
-    nextTaskLabel = 'Timed Up and Go';
+    nextTaskLabel = 'Get Up & Go';
   }
 
   return {
@@ -5040,8 +5082,8 @@ function getSuggestedNextProfileTask(sessions: SavedSession[]) {
 
   return {
     task: 'timed_up_and_go' as DailyTask,
-    label: 'Timed Up and Go',
-    reason: 'All starter areas have data. Timed Up and Go is the best full functional mobility recheck.',
+    label: 'Get Up & Go',
+    reason: 'All starter areas have data. Get Up & Go is the best full functional mobility recheck.',
   };
 }
 
@@ -6013,7 +6055,11 @@ export default function HomeScreen() {
     apiUrl: API_BASE_URL,
   });
   const [showServerDiagnostics, setShowServerDiagnostics] = useState(false);
-  const [mode, setMode] = useState<'rep' | 'rehab' | 'lab' | 'daily'>('rep');
+  // Redesign: 'daily' (a plain movement check, no jargon) is now the
+  // default for every user. 'rep' / 'rehab' / 'lab' are still fully
+  // functional -- they're just tucked behind "Advanced modes" now instead
+  // of being presented as four equal, unexplained options up front.
+  const [mode, setMode] = useState<'rep' | 'rehab' | 'lab' | 'daily'>('daily');
   const [dailyTask, setDailyTask] = useState<DailyTask>('reach');
   // Phase 1: which arm the backend should track. Defaults to 'right', which
   // is exactly the arm the backend always tracked before this selector
@@ -6196,6 +6242,50 @@ export default function HomeScreen() {
   const onDevicePose = useOnDevicePose();
   const OnDevicePoseWorker = onDevicePose.Worker;
   const [onDeviceJointCount, setOnDeviceJointCount] = useState<number | null>(null);
+
+  // Simplified navigation (redesign): most of the screen-specific "show*"
+  // flags above are full-screen overlays that used to each get their own
+  // permanent button on the home screen. `closeAllOverlays` is the single
+  // source of truth for "none of them are open" -- used when going Home,
+  // starting a new recording, or jumping straight to a specific screen, so
+  // we can never end up with two overlays fighting for the same early
+  // return. Add any new show* overlay flag here too.
+  const closeAllOverlays = () => {
+    setShowHistory(false);
+    setShowOnboarding(false);
+    setShowTestingGuide(false);
+    setShowFeedbackNotes(false);
+    setShowCameraSetupGuide(false);
+    setShowTransparency(false);
+    setShowTeamRoster(false);
+    setShowRolloutDashboard(false);
+    setShowGuidedTestWorkflow(false);
+    setShowBetaLaunchKit(false);
+    setShowTesterAnalytics(false);
+    setShowDailyHealthOverview(false);
+    setShowBuilderTools(false);
+    setShowReportExport(false);
+    setShowAiCoach(false);
+    setShowWhatsNew(false);
+    setShowSettings(false);
+    setShowWeeklyReport(false);
+    setShowYoloFramework(false);
+    setShowMobilityProfile(false);
+    setShowTrendEngine(false);
+    setShowGuidedOnboarding(false);
+    setShowServerDiagnostics(false);
+    setShowDailyCheckIn(false);
+    setShowInsights(false);
+  };
+
+  // Redesign: the home screen used to show every destination (including
+  // internal beta/testing tools) as an equal top-level button at once. Real
+  // end users now see a small, focused home screen; anything niche or
+  // internal lives one tap further in, behind these two disclosures.
+  // `showAdvancedOptions` is user-facing (advanced modes, calibration, team
+  // screening). `showDeveloperTools` is Wafi-only, tucked into Settings.
+  const [showAdvancedOptions, setShowAdvancedOptions] = useState(false);
+  const [showDeveloperTools, setShowDeveloperTools] = useState(false);
 
   const loadSavedSessions = async () => {
     try {
@@ -8174,6 +8264,58 @@ export default function HomeScreen() {
             <Text style={styles.secondaryButtonText}>What&apos;s New</Text>
           </Pressable>
         </View>
+
+        <Pressable
+          style={[styles.dailyTaskChip, { flex: 0, alignSelf: 'flex-start', paddingHorizontal: 14 }]}
+          onPress={() => setShowDeveloperTools(!showDeveloperTools)}
+        >
+          <Text style={styles.dailyTaskChipText}>
+            {showDeveloperTools ? 'Hide Developer & Beta Tools' : 'Developer & Beta Tools'}
+          </Text>
+        </Pressable>
+
+        {showDeveloperTools ? (
+          <View style={styles.cameraSetupCard}>
+            <Text style={styles.sectionTitle}>Developer & Beta Tools</Text>
+            <Text style={styles.dailyTaskDescription}>
+              Internal tools for testing and rollout. Not part of the normal app experience --
+              nothing here affects a regular user's data or results.
+            </Text>
+
+            <View style={styles.publicHomeTopActions}>
+              <Pressable style={styles.howItWorksButton} onPress={() => { setShowSettings(false); setShowServerDiagnostics(true); }}>
+                <Text style={styles.howItWorksButtonText}>Server Diagnostics</Text>
+              </Pressable>
+              <Pressable style={styles.howItWorksButton} onPress={() => { setShowSettings(false); setShowTestingGuide(true); }}>
+                <Text style={styles.howItWorksButtonText}>Testing Guide</Text>
+              </Pressable>
+              <Pressable style={styles.howItWorksButton} onPress={() => { setShowSettings(false); setShowFeedbackNotes(true); }}>
+                <Text style={styles.howItWorksButtonText}>Feedback Notes</Text>
+              </Pressable>
+              <Pressable style={styles.howItWorksButton} onPress={() => { setShowSettings(false); setShowGuidedTestWorkflow(true); }}>
+                <Text style={styles.howItWorksButtonText}>Guided Test Workflow</Text>
+              </Pressable>
+              <Pressable style={styles.howItWorksButton} onPress={() => { setShowSettings(false); setShowRolloutDashboard(true); }}>
+                <Text style={styles.howItWorksButtonText}>Rollout Dashboard</Text>
+              </Pressable>
+              <Pressable style={styles.howItWorksButton} onPress={() => { setShowSettings(false); setShowBetaLaunchKit(true); }}>
+                <Text style={styles.howItWorksButtonText}>Beta Launch Kit</Text>
+              </Pressable>
+              <Pressable style={styles.howItWorksButton} onPress={() => { setShowSettings(false); setShowTesterAnalytics(true); }}>
+                <Text style={styles.howItWorksButtonText}>Tester Analytics</Text>
+              </Pressable>
+              <Pressable style={styles.howItWorksButton} onPress={() => { setShowSettings(false); setShowBuilderTools(true); }}>
+                <Text style={styles.howItWorksButtonText}>Builder Tools</Text>
+              </Pressable>
+              <Pressable style={styles.howItWorksButton} onPress={() => { setShowSettings(false); setShowYoloFramework(true); }}>
+                <Text style={styles.howItWorksButtonText}>YOLO Module Framework</Text>
+              </Pressable>
+              <Pressable style={styles.howItWorksButton} onPress={() => { setShowSettings(false); setShowTrendEngine(true); }}>
+                <Text style={styles.howItWorksButtonText}>Trend Engine</Text>
+              </Pressable>
+            </View>
+          </View>
+        ) : null}
 
         <Pressable
           style={styles.mainButton}
@@ -12145,7 +12287,7 @@ export default function HomeScreen() {
         <Pressable
           style={styles.dailyHealthInlineButton}
           onPress={() => {
-            setShowHistory(false);
+            closeAllOverlays();
             setShowDailyHealthOverview(true);
           }}
         >
@@ -12451,150 +12593,28 @@ export default function HomeScreen() {
             <Text style={styles.heroBadgeText}>{APP_BETA_LABEL}</Text>
           </View>
 
-          <Text style={styles.title}>{APP_NAME}</Text>
-          <View style={styles.publicHomeTopActions}>
-            <View style={[styles.heroBadge, { marginBottom: 0 }]}>
-              <Text style={styles.heroBadgeText}>{getModeLabel(mode)}</Text>
-            </View>
-
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+            <Text style={styles.title}>{APP_NAME}</Text>
             <Pressable
-              style={styles.startHereTopButton}
-              onPress={() => setShowGuidedOnboarding(true)}
-            >
-              <Text style={styles.howItWorksButtonText}>Start Here</Text>
-            </Pressable>
-
-            <Pressable
-              style={styles.serverStatusTopButton}
-              onPress={() => setShowServerDiagnostics(true)}
-            >
-              <Text style={styles.howItWorksButtonText}>Server</Text>
-            </Pressable>
-
-            <Pressable
-              style={styles.howItWorksButton}
-              onPress={() => setShowOnboarding(true)}
-            >
-              <Text style={styles.howItWorksButtonText}>How It Works</Text>
-            </Pressable>
-
-            <Pressable
-              style={styles.howItWorksButton}
-              onPress={() => setShowTransparency(true)}
-            >
-              <Text style={styles.howItWorksButtonText}>Transparency</Text>
-            </Pressable>
-
-            <Pressable
-              style={styles.howItWorksButton}
-              onPress={() => setShowTeamRoster(true)}
-            >
-              <Text style={styles.howItWorksButtonText}>Team Roster</Text>
-            </Pressable>
-
-            <Pressable
-              style={styles.howItWorksButton}
-              onPress={() => setShowSettings(true)}
+              style={[styles.howItWorksButton, { position: 'relative' }]}
+              onPress={() => {
+                closeAllOverlays();
+                setShowSettings(true);
+              }}
               accessibilityRole="button"
               accessibilityLabel="Settings"
             >
               <Text style={styles.howItWorksButtonText}>Settings</Text>
-            </Pressable>
-
-            <Pressable
-              style={[styles.howItWorksButton, { position: 'relative' }]}
-              onPress={openWhatsNew}
-              accessibilityRole="button"
-              accessibilityLabel={
-                lastSeenWhatsNewVersion !== APP_VERSION
-                  ? "What's New (unread)"
-                  : "What's New"
-              }
-            >
-              <Text style={styles.howItWorksButtonText}>What&apos;s New</Text>
               {lastSeenWhatsNewVersion !== APP_VERSION ? (
                 <View style={styles.unreadDot} />
               ) : null}
             </Pressable>
-
-            <Pressable
-              style={styles.dailyHealthTopButton}
-              onPress={() => setShowDailyHealthOverview(true)}
-            >
-              <Text style={styles.howItWorksButtonText}>Daily Health Overview</Text>
-            </Pressable>
-
-            <Pressable
-              style={[styles.howItWorksButton, { position: 'relative' }]}
-              onPress={openDailyCheckIn}
-              accessibilityRole="button"
-              accessibilityLabel="Daily Check-In"
-            >
-              <Text style={styles.howItWorksButtonText}>Check-In</Text>
-              {!hasCheckedInToday(checkIns) ? (
-                <View style={styles.unreadDot} />
-              ) : null}
-            </Pressable>
-
-            <Pressable
-              style={styles.howItWorksButton}
-              onPress={() => setShowInsights(true)}
-            >
-              <Text style={styles.howItWorksButtonText}>Insights</Text>
-            </Pressable>
-
-            <Pressable
-              style={styles.reportTopButton}
-              onPress={() => setShowReportExport(true)}
-            >
-              <Text style={styles.howItWorksButtonText}>Movement Passport</Text>
-            </Pressable>
-
-            <Pressable
-              style={styles.trendEngineTopButton}
-              onPress={() => setShowTrendEngine(true)}
-            >
-              <Text style={styles.howItWorksButtonText}>Trend Engine</Text>
-            </Pressable>
-
-            <Pressable
-              style={styles.aiCoachTopButton}
-              onPress={() => setShowAiCoach(true)}
-            >
-              <Text style={styles.howItWorksButtonText}>AI Coach</Text>
-            </Pressable>
-
-            <Pressable
-              style={styles.weeklyReportTopButton}
-              onPress={() => setShowWeeklyReport(true)}
-            >
-              <Text style={styles.howItWorksButtonText}>Weekly Report</Text>
-            </Pressable>
-
-            <Pressable
-              style={styles.mobilityProfileTopButton}
-              onPress={() => setShowMobilityProfile(true)}
-            >
-              <Text style={styles.howItWorksButtonText}>Mobility Profile</Text>
-            </Pressable>
-
-            <Pressable
-              style={styles.cameraSetupTopButton}
-              onPress={() => setShowCameraSetupGuide(true)}
-            >
-              <Text style={styles.howItWorksButtonText}>Camera Setup</Text>
-            </Pressable>
-
-            <Pressable
-              style={styles.builderToolsTopButton}
-              onPress={() => setShowBuilderTools(true)}
-            >
-              <Text style={styles.howItWorksButtonText}>Builder Tools</Text>
-            </Pressable>
           </View>
 
-          <Text style={styles.subtitle}>
-            {APP_TAGLINE} Record a short movement check and get a clear score, confidence level, trend, and next action.
+          <Text style={styles.subtitle}>{APP_TAGLINE}</Text>
+          <Text style={[styles.subtitle, { marginTop: -8 }]}>
+            A simple way to check in on how you move and how you feel today -- for anyone, not just
+            athletes or physical therapy patients.
           </Text>
 
           <View style={styles.checkInHomeCard}>
@@ -12628,37 +12648,9 @@ export default function HomeScreen() {
             </View>
           </View>
 
-          <View style={styles.startHereCard}>
-            <Text style={styles.startHereCardTitle}>New here?</Text>
-            <Text style={styles.startHereCardText}>
-              Start with three guided checks so the app can build your first Mobility Profile.
-            </Text>
-
-            <Pressable
-              style={styles.startHereCardButton}
-              onPress={() => setShowGuidedOnboarding(true)}
-            >
-              <Text style={styles.buttonText}>Build My Profile</Text>
-            </Pressable>
-          </View>
-
-          <View style={styles.serverStatusCard}>
-            <Text style={styles.serverStatusCardTitle}>Analysis Server</Text>
-
-            <Text style={styles.serverStatusCardText}>
-              {getServerHealthBadgeLabel(serverHealth.status)} • {API_BASE_URL}
-            </Text>
-
-            <Text style={styles.serverStatusCardSubtext}>
-              {serverHealth.message}
-            </Text>
-
-            <Pressable
-              style={styles.serverStatusCardButton}
-              onPress={checkAnalysisServer}
-            >
-              <Text style={styles.buttonText}>Check Server</Text>
-            </Pressable>
+          <View style={styles.cameraSetupCard}>
+            <Text style={styles.sectionTitle}>{getDailyTip().title}</Text>
+            <Text style={styles.dailyTaskDescription}>{getDailyTip().text}</Text>
           </View>
 
           {savedSessions.length > 0 ? (
@@ -12701,20 +12693,6 @@ export default function HomeScreen() {
                   <Text style={styles.viewHistoryButtonText}>View History</Text>
                 </Pressable>
 
-                <Pressable
-                  style={styles.dailyHealthInlineButton}
-                  onPress={() => setShowDailyHealthOverview(true)}
-                >
-                  <Text style={styles.testingGuideButtonText}>Daily Overview</Text>
-                </Pressable>
-
-                <Pressable
-                  style={styles.builderSmallButton}
-                  onPress={() => setShowBuilderTools(true)}
-                >
-                  <Text style={styles.testingGuideButtonText}>Builder</Text>
-                </Pressable>
-
                 <Pressable style={styles.clearHistoryButton} onPress={clearSavedSessions}>
                   <Text style={styles.clearHistoryButtonText}>Clear Saved Checks</Text>
                 </Pressable>
@@ -12724,15 +12702,23 @@ export default function HomeScreen() {
 
           {savedSessions.length === 0 ? (
             <View style={styles.emptyPublicHomeCard}>
-              <Text style={styles.emptyPublicHomeTitle}>Start Your First Movement Check</Text>
+              <Text style={styles.emptyPublicHomeTitle}>New to Kinetra?</Text>
 
               <Text style={styles.emptyPublicHomeText}>
-                Record one simple movement to begin building your movement profile. Start with Reach if you want the easiest first check.
+                We&apos;ll walk you through 3 quick guided checks to get your baseline, or you can
+                jump straight into the easiest one -- Reach -- right now.
               </Text>
 
               <View style={styles.emptyPublicHomeButtonRow}>
                 <Pressable
                   style={styles.emptyPublicPrimaryButton}
+                  onPress={() => setShowGuidedOnboarding(true)}
+                >
+                  <Text style={styles.buttonText}>Start Guided Setup</Text>
+                </Pressable>
+
+                <Pressable
+                  style={styles.emptyPublicSecondaryButton}
                   onPress={() => {
                     setMode('daily');
                     setDailyTask('reach');
@@ -12740,56 +12726,89 @@ export default function HomeScreen() {
                     setStarted(false);
                   }}
                 >
-                  <Text style={styles.buttonText}>Start Reach Check</Text>
-                </Pressable>
-
-                <Pressable
-                  style={styles.emptyPublicSecondaryButton}
-                  onPress={() => setShowDailyHealthOverview(true)}
-                >
-                  <Text style={styles.secondaryButtonText}>View Overview</Text>
+                  <Text style={styles.secondaryButtonText}>Start Reach Check</Text>
                 </Pressable>
               </View>
             </View>
           ) : null}
 
-          <View style={styles.activeModulePreviewCard}>
-            <Text style={styles.homeOverviewLabel}>Active Analysis Module</Text>
-
-            <Text style={styles.homeOverviewStatus}>
-              {getActiveMovementModule(mode, dailyTask).title}
+          <Pressable
+            style={[styles.dailyTaskChip, { flex: 0, alignSelf: 'flex-start', paddingHorizontal: 14, marginTop: 4 }]}
+            onPress={() => setShowAdvancedOptions(!showAdvancedOptions)}
+            accessibilityRole="button"
+            accessibilityLabel="Advanced options"
+          >
+            <Text style={styles.dailyTaskChipText}>
+              {showAdvancedOptions ? 'Hide Advanced Options' : 'Show Advanced Options'}
             </Text>
+          </Pressable>
 
-            <Text style={styles.homeOverviewText}>
-              {getBackendLabel(getActiveMovementModule(mode, dailyTask).backend)} backend • {getActiveMovementModule(mode, dailyTask).purpose}
-            </Text>
-          </View>
-
-          <View style={styles.modeSelectorRow}>
-            {(['rep', 'rehab', 'daily', 'lab'] as const).map((m) => (
-              <Pressable
-                key={m}
-                style={[
-                  styles.modeChip,
-                  mode === m && styles.modeChipActive,
-                ]}
-                onPress={() => setMode(m)}
-              >
-                <Text
-                  style={[
-                    styles.modeChipText,
-                    mode === m && styles.modeChipTextActive,
-                  ]}
-                >
-                  {m.toUpperCase()}
+          {showAdvancedOptions ? (
+            <>
+              <View style={styles.dailyTaskBlock}>
+                <Text style={styles.dailyTaskTitle}>Check Type</Text>
+                <Text style={styles.dailyTaskDescription}>
+                  Most people only ever need Daily Movement Health. These other modes exist for
+                  specific cases: Rep Quality Coach for counted exercise reps, Rehab Tracker for
+                  repeated controlled movement, and Movement Lab for raw biomechanical metrics.
                 </Text>
-              </Pressable>
-            ))}
-          </View>
+                <View style={styles.modeSelectorRow}>
+                  {(['daily', 'rep', 'rehab', 'lab'] as const).map((m) => (
+                    <Pressable
+                      key={m}
+                      style={[
+                        styles.modeChip,
+                        mode === m && styles.modeChipActive,
+                      ]}
+                      onPress={() => setMode(m)}
+                    >
+                      <Text
+                        style={[
+                          styles.modeChipText,
+                          mode === m && styles.modeChipTextActive,
+                        ]}
+                      >
+                        {getModeLabel(m)}
+                      </Text>
+                    </Pressable>
+                  ))}
+                </View>
 
-          <Text style={styles.modeDescriptionText}>
-            {getModeDescription(mode)}
-          </Text>
+                <Text style={styles.modeDescriptionText}>
+                  {getModeDescription(mode)}
+                </Text>
+              </View>
+
+              <View style={styles.cameraSetupCard}>
+                <Text style={styles.sectionTitle}>Analysis Server</Text>
+
+                <Text style={styles.serverStatusCardText}>
+                  {getServerHealthBadgeLabel(serverHealth.status)} • {API_BASE_URL}
+                </Text>
+
+                <Text style={styles.serverStatusCardSubtext}>
+                  {serverHealth.message}
+                </Text>
+
+                <Pressable
+                  style={[styles.secondaryButton, { marginTop: 10 }]}
+                  onPress={checkAnalysisServer}
+                >
+                  <Text style={styles.secondaryButtonText}>Check Server</Text>
+                </Pressable>
+              </View>
+
+              <View style={styles.cameraSetupCard}>
+                <Text style={styles.sectionTitle}>Active Analysis Module</Text>
+
+                <Text style={styles.homeOverviewStatus}>
+                  {getActiveMovementModule(mode, dailyTask).title}
+                </Text>
+
+                <Text style={styles.homeOverviewText}>
+                  {getBackendLabel(getActiveMovementModule(mode, dailyTask).backend)} backend • {getActiveMovementModule(mode, dailyTask).purpose}
+                </Text>
+              </View>
 
           <View style={styles.dailyTaskBlock}>
             <Text style={styles.dailyTaskTitle}>Which Arm Are You Testing?</Text>
@@ -12893,6 +12912,8 @@ export default function HomeScreen() {
               )}
             </View>
           </View>
+            </>
+          ) : null}
 
           <View style={styles.dailyTaskBlock}>
             <Text style={styles.dailyTaskTitle}>Consistency Streak</Text>
@@ -12955,6 +12976,7 @@ export default function HomeScreen() {
             })()}
           </View>
 
+          {showAdvancedOptions ? (
           <View style={styles.dailyTaskBlock}>
             <Text style={styles.dailyTaskTitle}>Team Screening</Text>
 
@@ -13002,9 +13024,19 @@ export default function HomeScreen() {
                     Enter a name before recording, or this result will save without one.
                   </Text>
                 ) : null}
+                <Pressable
+                  style={[styles.secondaryButton, { marginTop: 10 }]}
+                  onPress={() => {
+                    closeAllOverlays();
+                    setShowTeamRoster(true);
+                  }}
+                >
+                  <Text style={styles.secondaryButtonText}>View Team Roster</Text>
+                </Pressable>
               </View>
             ) : null}
           </View>
+          ) : null}
 
           {mode === 'daily' ? (
             <View style={styles.dailyTaskBlock}>
@@ -13135,23 +13167,7 @@ export default function HomeScreen() {
           <Pressable
             style={styles.mainButton}
             onPress={() => {
-              setShowHistory(false);
-              setShowTestingGuide(false);
-              setShowFeedbackNotes(false);
-              setShowRolloutDashboard(false);
-              setShowGuidedTestWorkflow(false);
-              setShowBetaLaunchKit(false);
-              setShowTesterAnalytics(false);
-              setShowDailyHealthOverview(false);
-              setShowBuilderTools(false);
-              setShowReportExport(false);
-              setShowAiCoach(false);
-              setShowWeeklyReport(false);
-              setShowYoloFramework(false);
-              setShowMobilityProfile(false);
-              setShowTrendEngine(false);
-              setShowGuidedOnboarding(false);
-              setShowServerDiagnostics(false);
+              closeAllOverlays();
               setVideoUri(null);
               setRecording(false);
               setCameraReady(false);
@@ -13172,6 +13188,100 @@ export default function HomeScreen() {
           >
             <Text style={styles.buttonText}>Start</Text>
           </Pressable>
+
+          <Text style={[styles.sectionTitle, { marginTop: 28 }]}>Explore</Text>
+          <View style={styles.savedSessionButtonRow}>
+            <Pressable
+              style={styles.viewHistoryButton}
+              onPress={() => {
+                closeAllOverlays();
+                setShowHistory(true);
+              }}
+            >
+              <Text style={styles.viewHistoryButtonText}>History</Text>
+            </Pressable>
+            <Pressable
+              style={styles.viewHistoryButton}
+              onPress={() => {
+                closeAllOverlays();
+                setShowInsights(true);
+              }}
+            >
+              <Text style={styles.viewHistoryButtonText}>Insights</Text>
+            </Pressable>
+            <Pressable
+              style={styles.viewHistoryButton}
+              onPress={() => {
+                closeAllOverlays();
+                setShowAiCoach(true);
+              }}
+            >
+              <Text style={styles.viewHistoryButtonText}>AI Coach</Text>
+            </Pressable>
+          </View>
+
+          <Text style={[styles.sectionTitle, { marginTop: 20 }]}>More</Text>
+          <View style={styles.publicHomeTopActions}>
+            <Pressable
+              style={styles.howItWorksButton}
+              onPress={() => {
+                closeAllOverlays();
+                setShowOnboarding(true);
+              }}
+            >
+              <Text style={styles.howItWorksButtonText}>How It Works</Text>
+            </Pressable>
+
+            <Pressable
+              style={styles.howItWorksButton}
+              onPress={() => {
+                closeAllOverlays();
+                setShowCameraSetupGuide(true);
+              }}
+            >
+              <Text style={styles.howItWorksButtonText}>Camera Setup</Text>
+            </Pressable>
+
+            <Pressable
+              style={styles.howItWorksButton}
+              onPress={() => {
+                closeAllOverlays();
+                setShowReportExport(true);
+              }}
+            >
+              <Text style={styles.howItWorksButtonText}>Movement Passport</Text>
+            </Pressable>
+
+            <Pressable
+              style={styles.howItWorksButton}
+              onPress={() => {
+                closeAllOverlays();
+                setShowWeeklyReport(true);
+              }}
+            >
+              <Text style={styles.howItWorksButtonText}>Weekly Report</Text>
+            </Pressable>
+
+            <Pressable
+              style={styles.howItWorksButton}
+              onPress={() => {
+                closeAllOverlays();
+                setShowMobilityProfile(true);
+              }}
+            >
+              <Text style={styles.howItWorksButtonText}>Mobility Profile</Text>
+            </Pressable>
+
+            <Pressable
+              style={styles.howItWorksButton}
+              onPress={() => {
+                closeAllOverlays();
+                setShowTransparency(true);
+              }}
+            >
+              <Text style={styles.howItWorksButtonText}>Privacy & Transparency</Text>
+            </Pressable>
+          </View>
         </ScrollView>
       ) : videoUri ? (
         <View style={styles.fullScreen}>
@@ -15297,8 +15407,7 @@ export default function HomeScreen() {
             <Pressable
               style={styles.secondaryButton}
               onPress={() => {
-                setShowHistory(false);
-                setShowTestingGuide(false);
+                closeAllOverlays();
                 setStarted(true);
                 setVideoUri(null);
                 setRecording(false);
@@ -15316,24 +15425,7 @@ export default function HomeScreen() {
             <Pressable
               style={styles.dangerButton}
               onPress={() => {
-                setShowHistory(false);
-                setShowTestingGuide(false);
-                setShowFeedbackNotes(false);
-                setShowCameraSetupGuide(false);
-                setShowRolloutDashboard(false);
-                setShowGuidedTestWorkflow(false);
-                setShowBetaLaunchKit(false);
-                setShowTesterAnalytics(false);
-                setShowDailyHealthOverview(false);
-                setShowBuilderTools(false);
-                setShowReportExport(false);
-                setShowAiCoach(false);
-                setShowWeeklyReport(false);
-                setShowYoloFramework(false);
-                setShowMobilityProfile(false);
-                setShowTrendEngine(false);
-                setShowGuidedOnboarding(false);
-                setShowServerDiagnostics(false);
+                closeAllOverlays();
                 setStarted(false);
                 setVideoUri(null);
                 setRecording(false);
