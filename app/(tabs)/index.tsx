@@ -367,6 +367,98 @@ type ServerHealthState = {
 type AnalysisBackend = 'mediapipe' | 'yolo';
 type DailyTask = 'reach' | 'arm_raise' | 'sit_to_stand' | 'walking' | 'balance' | 'timed_up_and_go';
 
+// Redesign, round 2: asked once, on first launch, and used to decide what
+// the home screen leads with. Never shown again after it's answered (though
+// it can be changed from Settings). This is deliberately NOT a medical or
+// diagnostic question -- see APP_SAFETY_NOTE -- it only changes tone and
+// which existing feature gets suggested first.
+type UserGoal = 'curious' | 'recovering' | 'coach_referred' | 'checking_on_family';
+
+type TwoMinuteResetStep = {
+  title: string;
+  instruction: string;
+  seconds: number;
+};
+
+// A guided, no-camera, no-score stretch break. Lives entirely outside the
+// movement-check/analysis pipeline -- nothing here is recorded, uploaded, or
+// saved -- so it has real standalone value for someone who never wants a
+// score, not just a relabeled version of a movement check.
+const TWO_MINUTE_RESET_STEPS: TwoMinuteResetStep[] = [
+  {
+    title: 'Neck Roll',
+    instruction: 'Slowly drop your chin toward your chest, then roll your head in a gentle circle. Keep it slow and pain-free.',
+    seconds: 20,
+  },
+  {
+    title: 'Shoulder Rolls',
+    instruction: 'Roll both shoulders up, back, and down in a slow circle. Let your arms hang loose.',
+    seconds: 20,
+  },
+  {
+    title: 'Standing Side Stretch',
+    instruction: 'Reach one arm overhead and lean gently to the opposite side. Feel the stretch along your side, then switch.',
+    seconds: 25,
+  },
+  {
+    title: 'Forward Fold',
+    instruction: 'Let your upper body hang forward, knees soft, arms relaxed toward the floor. Let your neck and back release.',
+    seconds: 25,
+  },
+  {
+    title: 'Deep Breaths',
+    instruction: 'Stand or sit tall. Breathe in slowly through your nose for a count of 4, then out through your mouth for a count of 6.',
+    seconds: 30,
+  },
+];
+
+function getSuggestedFirstAction(goal: UserGoal | null): {
+  eyebrow: string;
+  title: string;
+  text: string;
+  ctaLabel: string;
+  target: 'reset' | 'checkin' | 'guided' | 'movement';
+} {
+  if (goal === 'recovering') {
+    return {
+      eyebrow: 'Recovering From Something',
+      title: 'Start With a Guided Baseline',
+      text: 'Three quick movement checks give you a starting point, so you can see real change over time -- not just how today feels.',
+      ctaLabel: 'Start Guided Setup',
+      target: 'guided',
+    };
+  }
+
+  if (goal === 'coach_referred') {
+    return {
+      eyebrow: 'Sent Here By a Coach or PT',
+      title: 'Start With a Guided Baseline',
+      text: "Run the guided starter checks first -- it's the fastest way to have something concrete to bring back to whoever sent you here.",
+      ctaLabel: 'Start Guided Setup',
+      target: 'guided',
+    };
+  }
+
+  if (goal === 'checking_on_family') {
+    return {
+      eyebrow: 'Checking On a Family Member',
+      title: 'Try a Balance or Get Up & Go Check',
+      text: 'These two say the most about everyday safety and independence. Turn on Team Screening in Advanced Options to tag results with their name.',
+      ctaLabel: 'Start a Movement Check',
+      target: 'movement',
+    };
+  }
+
+  // 'curious', or no answer yet (userGoal still loading / skipped).
+  return {
+    eyebrow: 'Just Getting Started',
+    title: 'No Pressure -- Start Small',
+    text: "Try a 2-Minute Reset if you just want to feel a little better right now, or log a 30-second check-in. The camera-based movement checks will still be here when you're curious.",
+    ctaLabel: 'Try the 2-Minute Reset',
+    target: 'reset',
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Daily Check-In: a fully local, no-camera subjective log.
 //
@@ -3472,16 +3564,16 @@ function getMovementPassport(sessions: SavedSession[]) {
       ? Math.round(allScores.reduce((sum, score) => sum + score, 0) / allScores.length)
       : null;
 
-  let passportStatus = 'No Passport Data Yet';
-  let passportHeadline = 'Start Your Movement Passport';
-  let passportSummary = 'Save movement checks to generate a shareable movement passport.';
+  let passportStatus = 'No Summary Data Yet';
+  let passportHeadline = 'Start Your Summary';
+  let passportSummary = 'Save movement checks to generate a shareable summary.';
   let movementFingerprint = 'Not enough data yet';
   let passportReadiness = 'Not ready to share yet';
   let nextAction = 'Complete the guided starter checks first.';
 
   if (startedTasks.length > 0) {
-    passportStatus = 'Passport Building';
-    passportHeadline = 'Movement Passport Building';
+    passportStatus = 'Summary Building';
+    passportHeadline = 'Your Summary Is Building';
     passportSummary = 'Your saved checks are starting to form a personal movement profile.';
     movementFingerprint = mobilityProfile.profileType;
     passportReadiness = 'Early snapshot';
@@ -3489,30 +3581,30 @@ function getMovementPassport(sessions: SavedSession[]) {
   }
 
   if (startedTasks.length >= 3) {
-    passportStatus = 'Passport Snapshot Ready';
-    passportHeadline = 'Movement Passport Snapshot Ready';
+    passportStatus = 'Summary Snapshot Ready';
+    passportHeadline = 'Your Summary Snapshot Is Ready';
     passportSummary = 'You have enough saved checks to summarize your movement profile across multiple areas.';
     passportReadiness = 'Shareable snapshot';
     nextAction = mobilityProfile.recommendedNext;
   }
 
   if (baselineReadyTasks.length >= 2) {
-    passportStatus = 'Baseline Passport Ready';
-    passportHeadline = 'Baseline Movement Passport Ready';
-    passportSummary = 'Your passport includes multiple baseline-ready movement areas.';
+    passportStatus = 'Baseline Summary Ready';
+    passportHeadline = 'Baseline Summary Ready';
+    passportSummary = 'Your summary includes multiple baseline-ready movement areas.';
     passportReadiness = 'Stronger baseline snapshot';
   }
 
   if (watchTasks.length > 0) {
-    passportStatus = 'Passport Recheck Needed';
-    passportHeadline = 'Movement Passport Needs Recheck';
-    passportSummary = `${watchTasks[0].label} needs a recheck before this passport should be treated as stable.`;
+    passportStatus = 'Recheck Needed';
+    passportHeadline = 'Your Summary Needs a Recheck';
+    passportSummary = `${watchTasks[0].label} needs a recheck before this summary should be treated as stable.`;
     nextAction = watchTasks[0].recommendation;
   }
 
   if (baselineReadyTasks.length >= 3 && watchTasks.length === 0) {
-    passportStatus = 'Stable Movement Passport';
-    passportHeadline = 'Stable Movement Passport';
+    passportStatus = 'Stable Summary';
+    passportHeadline = 'Your Summary Looks Stable';
     passportSummary = 'Your current saved checks suggest a stable movement profile across the tracked areas.';
     passportReadiness = 'Strong shareable snapshot';
   }
@@ -3601,15 +3693,15 @@ function getMovementPassportText(sessions: SavedSession[]) {
       ? passport.trendSummary.improvingTasks.map((item) => `- ${item.label}: ${item.summary}`).join('\n')
       : '- No clear improvement areas yet.';
 
-  return `Kinetra Passport
+  return `Kinetra Summary
 
 Generated:
 ${formatSessionDate(passport.generatedAt)}
 
-Passport Status:
+Status:
 ${passport.passportStatus}
 
-Passport Score:
+Overall Score:
 ${passport.averageScore !== null ? `${passport.averageScore}/100` : 'Not enough data yet'}
 
 Movement Fingerprint:
@@ -6287,6 +6379,51 @@ export default function HomeScreen() {
   const [showAdvancedOptions, setShowAdvancedOptions] = useState(false);
   const [showDeveloperTools, setShowDeveloperTools] = useState(false);
 
+  // Redesign, round 2: a one-time "why are you here" question for a brand
+  // new user. This isn't cosmetic -- `userGoal` genuinely changes what the
+  // home screen suggests first (see getSuggestedFirstAction below), so
+  // someone who is just curious isn't handed the same "build a mobility
+  // profile" push as someone recovering from something. `userGoalLoaded`
+  // exists purely so we don't flash the question for a split second while
+  // AsyncStorage is still being read on a returning user's launch.
+  const [userGoal, setUserGoal] = useState<UserGoal | null>(null);
+  const [userGoalLoaded, setUserGoalLoaded] = useState(false);
+
+  // Redesign, round 2: "2-Minute Reset" -- a guided, no-camera, no-score
+  // stretch break. Deliberately outside the movement-check/analysis system
+  // entirely (no video, no upload, no saved session) so it has real value
+  // for someone who never wants a score at all, not just a relabeled
+  // check. `resetSecondsLeft` counts down per step; `resetRunning` gates
+  // the interval so leaving the screen (or pausing) can't leak a timer.
+  const [showTwoMinuteReset, setShowTwoMinuteReset] = useState(false);
+  const [resetState, setResetState] = useState({
+    stepIndex: 0,
+    secondsLeft: TWO_MINUTE_RESET_STEPS[0].seconds,
+  });
+  const [resetRunning, setResetRunning] = useState(false);
+
+  const loadUserGoal = async () => {
+    try {
+      const raw = await AsyncStorage.getItem('kinetra_user_goal_v1');
+      if (raw === 'curious' || raw === 'recovering' || raw === 'coach_referred' || raw === 'checking_on_family') {
+        setUserGoal(raw);
+      }
+    } catch (error) {
+      console.log('Failed to load user goal:', error);
+    } finally {
+      setUserGoalLoaded(true);
+    }
+  };
+
+  const saveUserGoal = async (goal: UserGoal) => {
+    setUserGoal(goal);
+    try {
+      await AsyncStorage.setItem('kinetra_user_goal_v1', goal);
+    } catch (error) {
+      console.log('Failed to save user goal:', error);
+    }
+  };
+
   const loadSavedSessions = async () => {
     try {
       const raw = await AsyncStorage.getItem('movement_sessions_v1');
@@ -6984,8 +7121,38 @@ export default function HomeScreen() {
     loadReminderSettings();
     loadWhatsNewStatus();
     loadCheckIns();
+    loadUserGoal();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [requestPermission]);
+
+  // 2-Minute Reset countdown. Ticks resetState.secondsLeft down to 0 while
+  // resetRunning, then auto-advances to the next step (or stops at the
+  // end). stepIndex and secondsLeft are updated together in one setState
+  // call so a step transition can never render an intermediate frame with
+  // the new step's title but the old step's leftover seconds. Cleared on
+  // every re-render and on unmount so leaving the screen can never leave a
+  // stray interval running.
+  useEffect(() => {
+    if (!resetRunning) return;
+
+    const interval = setInterval(() => {
+      setResetState(({ stepIndex, secondsLeft }) => {
+        if (secondsLeft > 1) {
+          return { stepIndex, secondsLeft: secondsLeft - 1 };
+        }
+
+        const nextIndex = stepIndex + 1;
+        if (nextIndex >= TWO_MINUTE_RESET_STEPS.length) {
+          setResetRunning(false);
+          return { stepIndex, secondsLeft: 0 };
+        }
+
+        return { stepIndex: nextIndex, secondsLeft: TWO_MINUTE_RESET_STEPS[nextIndex].seconds };
+      });
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [resetRunning]);
 
   // ----- On-device pose snapshot loop (Step 1) -----------------------------
   // While the user is recording, grab a still frame from the camera once a
@@ -7382,6 +7549,57 @@ export default function HomeScreen() {
 
         <Pressable style={styles.mainButton} onPress={finishOnboarding}>
           <Text style={styles.buttonText}>Start Movement Check</Text>
+        </Pressable>
+      </ScrollView>
+    );
+  }
+
+  // Redesign, round 2: a single, one-time question shown right after
+  // onboarding (or on first launch for anyone who already dismissed
+  // onboarding before this existed). It's the difference between a home
+  // screen that guesses what a stranger wants and one that just asks --
+  // see getSuggestedFirstAction, which uses the answer to change what gets
+  // suggested first. Answering (including "just looking around") saves a
+  // UserGoal and this never shows again.
+  if (userGoalLoaded && !userGoal && !showOnboarding) {
+    return (
+      <ScrollView
+        style={styles.homeScroll}
+        contentContainerStyle={styles.cameraSetupContent}
+        showsVerticalScrollIndicator={false}
+      >
+        <View style={styles.heroBadge}>
+          <Text style={styles.heroBadgeText}>One Quick Thing</Text>
+        </View>
+
+        <Text style={styles.title}>What Brings You Here?</Text>
+
+        <Text style={styles.subtitle}>
+          This just changes what we suggest first -- nothing else. You can always reach everything from Settings regardless.
+        </Text>
+
+        <Pressable style={styles.personaOptionCard} onPress={() => saveUserGoal('recovering')}>
+          <Text style={styles.personaOptionTitle}>Recovering From Something</Text>
+          <Text style={styles.personaOptionText}>An injury, surgery, or health event you're working back from.</Text>
+        </Pressable>
+
+        <Pressable style={styles.personaOptionCard} onPress={() => saveUserGoal('coach_referred')}>
+          <Text style={styles.personaOptionTitle}>A Coach, PT, or Doctor Sent Me Here</Text>
+          <Text style={styles.personaOptionText}>Someone told you to track something specific.</Text>
+        </Pressable>
+
+        <Pressable style={styles.personaOptionCard} onPress={() => saveUserGoal('checking_on_family')}>
+          <Text style={styles.personaOptionTitle}>Checking On a Family Member</Text>
+          <Text style={styles.personaOptionText}>Keeping an eye on an aging parent or relative's balance and mobility.</Text>
+        </Pressable>
+
+        <Pressable style={styles.personaOptionCard} onPress={() => saveUserGoal('curious')}>
+          <Text style={styles.personaOptionTitle}>Just Curious</Text>
+          <Text style={styles.personaOptionText}>No specific reason -- you just want to see what this does.</Text>
+        </Pressable>
+
+        <Pressable style={styles.secondaryButton} onPress={() => saveUserGoal('curious')}>
+          <Text style={styles.secondaryButtonText}>Skip -- I'll just look around</Text>
         </Pressable>
       </ScrollView>
     );
@@ -9798,6 +10016,106 @@ export default function HomeScreen() {
     );
   }
 
+  if (showTwoMinuteReset) {
+    const currentStep = TWO_MINUTE_RESET_STEPS[resetState.stepIndex];
+    const isLastStep = resetState.stepIndex === TWO_MINUTE_RESET_STEPS.length - 1;
+    const isFinished = !resetRunning && isLastStep && resetState.secondsLeft === 0;
+
+    const goToStep = (index: number) => {
+      const clamped = Math.max(0, Math.min(index, TWO_MINUTE_RESET_STEPS.length - 1));
+      setResetState({ stepIndex: clamped, secondsLeft: TWO_MINUTE_RESET_STEPS[clamped].seconds });
+    };
+
+    return (
+      <ScrollView
+        style={styles.homeScroll}
+        contentContainerStyle={styles.cameraSetupContent}
+        showsVerticalScrollIndicator={false}
+      >
+        <View style={styles.heroBadge}>
+          <Text style={styles.heroBadgeText}>2-Minute Reset</Text>
+        </View>
+
+        <Text style={styles.title}>{isFinished ? 'Nice Work' : currentStep.title}</Text>
+
+        <Text style={styles.subtitle}>
+          {isFinished
+            ? 'That\'s the full reset. No score, no video -- just a couple minutes back for you.'
+            : currentStep.instruction}
+        </Text>
+
+        <View style={styles.resetProgressDotsRow}>
+          {TWO_MINUTE_RESET_STEPS.map((step, index) => (
+            <View
+              key={step.title}
+              style={[
+                styles.resetProgressDot,
+                index === resetState.stepIndex && !isFinished && styles.resetProgressDotActive,
+                (index < resetState.stepIndex || isFinished) && styles.resetProgressDotDone,
+              ]}
+            />
+          ))}
+        </View>
+
+        {!isFinished ? (
+          <View style={styles.resetStepCard}>
+            <Text style={styles.resetCountdownNumber}>{resetState.secondsLeft}</Text>
+            <Text style={styles.dailyTaskDescription}>seconds</Text>
+          </View>
+        ) : null}
+
+        {!isFinished ? (
+          <View style={styles.savedSessionButtonRow}>
+            <Pressable
+              style={styles.viewHistoryButton}
+              onPress={() => setResetRunning(!resetRunning)}
+            >
+              <Text style={styles.viewHistoryButtonText}>{resetRunning ? 'Pause' : 'Resume'}</Text>
+            </Pressable>
+
+            <Pressable
+              style={styles.viewHistoryButton}
+              onPress={() => {
+                if (isLastStep) {
+                  setResetRunning(false);
+                  goToStep(resetState.stepIndex);
+                  setResetState({ stepIndex: resetState.stepIndex, secondsLeft: 0 });
+                } else {
+                  goToStep(resetState.stepIndex + 1);
+                }
+              }}
+            >
+              <Text style={styles.viewHistoryButtonText}>{isLastStep ? 'Finish' : 'Skip'}</Text>
+            </Pressable>
+          </View>
+        ) : null}
+
+        {isFinished ? (
+          <Pressable
+            style={[styles.secondaryButton, { marginTop: 10 }]}
+            onPress={() => {
+              goToStep(0);
+              setResetRunning(true);
+            }}
+          >
+            <Text style={styles.secondaryButtonText}>Do It Again</Text>
+          </Pressable>
+        ) : null}
+
+        <Pressable
+          style={styles.mainButton}
+          onPress={() => {
+            setShowTwoMinuteReset(false);
+            setResetRunning(false);
+            goToStep(0);
+          }}
+        >
+          <Text style={styles.buttonText}>{isFinished ? 'Back Home' : 'Exit'}</Text>
+        </Pressable>
+      </ScrollView>
+    );
+  }
+
   if (showDailyCheckIn) {
     const todayCheckIn = getTodayCheckIn(checkIns);
 
@@ -10284,17 +10602,18 @@ export default function HomeScreen() {
         showsVerticalScrollIndicator={false}
       >
         <View style={styles.heroBadge}>
-          <Text style={styles.heroBadgeText}>Movement Passport</Text>
+          <Text style={styles.heroBadgeText}>Your Summary</Text>
         </View>
 
-        <Text style={styles.title}>Kinetra Passport</Text>
+        <Text style={styles.title}>Your Movement Summary</Text>
 
         <Text style={styles.subtitle}>
-          A shareable snapshot of your movement profile, trends, baselines, watch areas, and recommended next action.
+          A shareable snapshot you can save or send to anyone -- a doctor, a coach, or just yourself --
+          covering your trends, baselines, watch areas, and recommended next action.
         </Text>
 
         <View style={styles.passportHeroCard}>
-          <Text style={styles.sectionTitle}>Passport Summary</Text>
+          <Text style={styles.sectionTitle}>Summary</Text>
 
           <Text style={styles.passportHeadline}>
             {passport.passportHeadline}
@@ -10320,7 +10639,7 @@ export default function HomeScreen() {
           </View>
 
           <Text style={[styles.metricLabelSmall, styles.metricLabelSpacing]}>
-            Movement Passport Score
+            Overall Score
           </Text>
           <Text style={styles.passportScoreText}>
             {passport.averageScore !== null ? `${passport.averageScore}/100` : 'N/A'}
@@ -10615,7 +10934,7 @@ export default function HomeScreen() {
           style={styles.shareBetaButton}
           onPress={shareMovementReport}
         >
-          <Text style={styles.buttonText}>Share Kinetra Passport</Text>
+          <Text style={styles.buttonText}>Share Your Summary</Text>
         </Pressable>
 
         <Pressable
@@ -12617,6 +12936,34 @@ export default function HomeScreen() {
             athletes or physical therapy patients.
           </Text>
 
+          {(() => {
+            const suggestion = getSuggestedFirstAction(userGoal);
+            const handleSuggestionPress = () => {
+              if (suggestion.target === 'reset') {
+                setShowTwoMinuteReset(true);
+              } else if (suggestion.target === 'checkin') {
+                openDailyCheckIn();
+              } else if (suggestion.target === 'guided') {
+                setShowGuidedOnboarding(true);
+              } else {
+                setMode('daily');
+                setDailyTask('balance');
+                setShowCameraSetupGuide(true);
+                setStarted(false);
+              }
+            };
+            return (
+              <View style={styles.heroSuggestionCard}>
+                <Text style={styles.heroSuggestionEyebrow}>{suggestion.eyebrow}</Text>
+                <Text style={styles.heroSuggestionTitle}>{suggestion.title}</Text>
+                <Text style={styles.heroSuggestionText}>{suggestion.text}</Text>
+                <Pressable style={styles.checkInHomeButton} onPress={handleSuggestionPress}>
+                  <Text style={styles.buttonText}>{suggestion.ctaLabel}</Text>
+                </Pressable>
+              </View>
+            );
+          })()}
+
           <View style={styles.checkInHomeCard}>
             <Text style={styles.checkInHomeCardTitle}>
               {hasCheckedInToday(checkIns) ? "Today's Check-In Done" : 'Quick Daily Check-In'}
@@ -12695,38 +13042,6 @@ export default function HomeScreen() {
 
                 <Pressable style={styles.clearHistoryButton} onPress={clearSavedSessions}>
                   <Text style={styles.clearHistoryButtonText}>Clear Saved Checks</Text>
-                </Pressable>
-              </View>
-            </View>
-          ) : null}
-
-          {savedSessions.length === 0 ? (
-            <View style={styles.emptyPublicHomeCard}>
-              <Text style={styles.emptyPublicHomeTitle}>New to Kinetra?</Text>
-
-              <Text style={styles.emptyPublicHomeText}>
-                We&apos;ll walk you through 3 quick guided checks to get your baseline, or you can
-                jump straight into the easiest one -- Reach -- right now.
-              </Text>
-
-              <View style={styles.emptyPublicHomeButtonRow}>
-                <Pressable
-                  style={styles.emptyPublicPrimaryButton}
-                  onPress={() => setShowGuidedOnboarding(true)}
-                >
-                  <Text style={styles.buttonText}>Start Guided Setup</Text>
-                </Pressable>
-
-                <Pressable
-                  style={styles.emptyPublicSecondaryButton}
-                  onPress={() => {
-                    setMode('daily');
-                    setDailyTask('reach');
-                    setShowCameraSetupGuide(true);
-                    setStarted(false);
-                  }}
-                >
-                  <Text style={styles.secondaryButtonText}>Start Reach Check</Text>
                 </Pressable>
               </View>
             </View>
@@ -13195,6 +13510,15 @@ export default function HomeScreen() {
               style={styles.viewHistoryButton}
               onPress={() => {
                 closeAllOverlays();
+                setShowTwoMinuteReset(true);
+              }}
+            >
+              <Text style={styles.viewHistoryButtonText}>2-Minute Reset</Text>
+            </Pressable>
+            <Pressable
+              style={styles.viewHistoryButton}
+              onPress={() => {
+                closeAllOverlays();
                 setShowHistory(true);
               }}
             >
@@ -13249,7 +13573,7 @@ export default function HomeScreen() {
                 setShowReportExport(true);
               }}
             >
-              <Text style={styles.howItWorksButtonText}>Movement Passport</Text>
+              <Text style={styles.howItWorksButtonText}>Your Summary</Text>
             </Pressable>
 
             <Pressable
@@ -19875,5 +20199,106 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 20,
     marginTop: 4,
+  },
+
+  resetProgressDotsRow: {
+    flexDirection: 'row',
+    gap: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 24,
+  },
+
+  resetProgressDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 999,
+    backgroundColor: 'rgba(148, 163, 184, 0.25)',
+  },
+
+  resetProgressDotActive: {
+    backgroundColor: '#2563eb',
+    width: 14,
+    height: 14,
+    borderRadius: 999,
+  },
+
+  resetProgressDotDone: {
+    backgroundColor: '#7dd3fc',
+  },
+
+  resetStepCard: {
+    width: '100%',
+    maxWidth: 280,
+    backgroundColor: 'rgba(30, 41, 59, 0.95)',
+    borderWidth: 1,
+    borderColor: 'rgba(96, 165, 250, 0.24)',
+    borderRadius: 22,
+    paddingVertical: 32,
+    alignItems: 'center',
+    marginBottom: 24,
+  },
+
+  resetCountdownNumber: {
+    color: '#ffffff',
+    fontSize: 56,
+    fontWeight: '800',
+    marginBottom: 4,
+  },
+
+  personaOptionCard: {
+    width: '100%',
+    backgroundColor: 'rgba(30, 41, 59, 0.95)',
+    borderWidth: 1,
+    borderColor: 'rgba(96, 165, 250, 0.18)',
+    borderRadius: 18,
+    padding: 16,
+    marginBottom: 12,
+  },
+
+  personaOptionTitle: {
+    color: '#ffffff',
+    fontSize: 16,
+    fontWeight: '700',
+    marginBottom: 4,
+  },
+
+  personaOptionText: {
+    color: '#94a3b8',
+    fontSize: 13,
+    lineHeight: 19,
+  },
+
+  heroSuggestionCard: {
+    width: '100%',
+    backgroundColor: 'rgba(37, 99, 235, 0.14)',
+    borderWidth: 1,
+    borderColor: 'rgba(96, 165, 250, 0.35)',
+    borderRadius: 20,
+    padding: 18,
+    marginBottom: 18,
+  },
+
+  heroSuggestionEyebrow: {
+    color: '#93c5fd',
+    fontSize: 12,
+    fontWeight: '800',
+    letterSpacing: 0.4,
+    marginBottom: 6,
+    textTransform: 'uppercase',
+  },
+
+  heroSuggestionTitle: {
+    color: '#ffffff',
+    fontSize: 19,
+    fontWeight: '800',
+    marginBottom: 6,
+  },
+
+  heroSuggestionText: {
+    color: '#cbd5e1',
+    fontSize: 14,
+    lineHeight: 20,
+    marginBottom: 14,
   },
 });
