@@ -7580,7 +7580,7 @@ export default function HomeScreen() {
 
         <Pressable style={styles.personaOptionCard} onPress={() => saveUserGoal('recovering')}>
           <Text style={styles.personaOptionTitle}>Recovering From Something</Text>
-          <Text style={styles.personaOptionText}>An injury, surgery, or health event you're working back from.</Text>
+          <Text style={styles.personaOptionText}>An injury, surgery, or health event you&apos;re working back from.</Text>
         </Pressable>
 
         <Pressable style={styles.personaOptionCard} onPress={() => saveUserGoal('coach_referred')}>
@@ -7590,7 +7590,7 @@ export default function HomeScreen() {
 
         <Pressable style={styles.personaOptionCard} onPress={() => saveUserGoal('checking_on_family')}>
           <Text style={styles.personaOptionTitle}>Checking On a Family Member</Text>
-          <Text style={styles.personaOptionText}>Keeping an eye on an aging parent or relative's balance and mobility.</Text>
+          <Text style={styles.personaOptionText}>Keeping an eye on an aging parent or relative&apos;s balance and mobility.</Text>
         </Pressable>
 
         <Pressable style={styles.personaOptionCard} onPress={() => saveUserGoal('curious')}>
@@ -7599,7 +7599,7 @@ export default function HomeScreen() {
         </Pressable>
 
         <Pressable style={styles.secondaryButton} onPress={() => saveUserGoal('curious')}>
-          <Text style={styles.secondaryButtonText}>Skip -- I'll just look around</Text>
+          <Text style={styles.secondaryButtonText}>Skip -- I&apos;ll just look around</Text>
         </Pressable>
       </ScrollView>
     );
@@ -8497,7 +8497,7 @@ export default function HomeScreen() {
             <Text style={styles.sectionTitle}>Developer & Beta Tools</Text>
             <Text style={styles.dailyTaskDescription}>
               Internal tools for testing and rollout. Not part of the normal app experience --
-              nothing here affects a regular user's data or results.
+              nothing here affects a regular user&apos;s data or results.
             </Text>
 
             <View style={styles.publicHomeTopActions}>
