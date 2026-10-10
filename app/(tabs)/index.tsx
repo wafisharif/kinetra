@@ -8469,7 +8469,7 @@ export default function HomeScreen() {
         <View style={styles.cameraSetupCard}>
           <Text style={styles.sectionTitle}>About</Text>
           <Text style={styles.dailyTaskDescription}>
-            {APP_NAME} {APP_BETA_LABEL} -- version {APP_VERSION}{'\n'}
+            {APP_NAME}{__DEV__ ? ` ${APP_BETA_LABEL}` : ''} -- version {APP_VERSION}{'\n'}
             Analysis server: {API_BASE_URL}
           </Text>
           <Pressable
@@ -8483,6 +8483,7 @@ export default function HomeScreen() {
           </Pressable>
         </View>
 
+        {__DEV__ ? (
         <Pressable
           style={[styles.dailyTaskChip, { flex: 0, alignSelf: 'flex-start', paddingHorizontal: 14 }]}
           onPress={() => setShowDeveloperTools(!showDeveloperTools)}
@@ -8491,8 +8492,9 @@ export default function HomeScreen() {
             {showDeveloperTools ? 'Hide Developer & Beta Tools' : 'Developer & Beta Tools'}
           </Text>
         </Pressable>
+        ) : null}
 
-        {showDeveloperTools ? (
+        {__DEV__ && showDeveloperTools ? (
           <View style={styles.cameraSetupCard}>
             <Text style={styles.sectionTitle}>Developer & Beta Tools</Text>
             <Text style={styles.dailyTaskDescription}>
@@ -12908,9 +12910,11 @@ export default function HomeScreen() {
           contentContainerStyle={styles.homeScrollContent}
           showsVerticalScrollIndicator={false}
         >
+          {__DEV__ ? (
           <View style={styles.heroBadge}>
             <Text style={styles.heroBadgeText}>{APP_BETA_LABEL}</Text>
           </View>
+          ) : null}
 
           <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
             <Text style={styles.title}>{APP_NAME}</Text>
