@@ -34,6 +34,13 @@ async function seedAndReload(page) {
   await page.goto('/');
   await page.evaluate((sessions) => {
     window.localStorage.setItem('has_seen_onboarding_v1', 'true');
+    // Regression test infra fix: the Home screen gates its whole render
+    // behind a one-time "What Brings You Here?" goal picker
+    // (kinetra_user_goal_v1) that this suite never seeded, so every test
+    // below was silently hitting the goal picker instead of Home -- not a
+    // bug in the app, a gap in this suite's seed data. 'curious' is the
+    // same default the app itself falls back to when no goal is set.
+    window.localStorage.setItem('kinetra_user_goal_v1', 'curious');
     window.localStorage.setItem('movement_sessions_v1', JSON.stringify(sessions));
     window.localStorage.setItem('calibrated_thresholds_v1', JSON.stringify({ left: null, right: { flex: 90, extend: 120 } }));
   }, SESSIONS);
@@ -92,16 +99,25 @@ test.describe('Kinetra regression suite', () => {
   test('home renders with saved sessions and nav chips', async ({ page }) => {
     const text = await page.locator('body').innerText();
     expect(text).toContain('Kinetra');
-    expect(text).toContain('Team Roster');
+    expect(text).toContain('Your Summary');
     expect(text).toContain('Settings');
-    // Regression check: the mode selector chips (REP/REHAB/DAILY/LAB) used
-    // to show no explanation of what each mode means. Confirms the
-    // corresponding description text for the default mode ('rep') actually
-    // renders alongside them now.
-    expect(text).toContain('Analyze repeated movement quality');
+    // Regression check: confirms the feature-preview text for the current
+    // default mode ('daily', since the "declutter navigation, broaden
+    // appeal" redesign made Daily Movement Health the default experience
+    // instead of Rep Quality Coach) renders on the home screen. The
+    // mode-selector chips themselves (and their getModeDescription() text)
+    // moved behind "Show Advanced Options" in that same redesign -- see the
+    // "team roster" test above for the same collapsed-by-default pattern.
+    expect(text).toContain('Stability, control, efficiency, and daily movement quality.');
   });
 
   test('team roster shows athletes and flags the poor grade', async ({ page }) => {
+    // Team Roster is a coach-only tool, collapsed by default: Show Advanced
+    // Options -> enable Team Screening -> View Team Roster.
+    await clickText(page, 'Show Advanced Options');
+    await page.waitForTimeout(300);
+    await clickText(page, 'Team Screening: Off');
+    await page.waitForTimeout(300);
     await clickText(page, 'Team Roster');
     await page.waitForTimeout(600);
     const text = await page.locator('body').innerText();
@@ -165,7 +181,7 @@ test.describe('Kinetra regression suite', () => {
 
   test('Movement Passport highlight cards wrap their text instead of clipping it', async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 800 });
-    await clickText(page, 'Movement Passport');
+    await clickText(page, 'Your Summary');
     await page.waitForTimeout(600);
 
     const loc = page.getByText('Strongest Area', { exact: true }).first();
@@ -242,6 +258,10 @@ test.describe('Kinetra regression suite', () => {
     });
 
     await seedAndReload(page);
+    await clickText(page, 'Show Advanced Options');
+    await page.waitForTimeout(300);
+    await clickText(page, 'Team Screening: Off');
+    await page.waitForTimeout(300);
     await clickText(page, 'Team Roster');
     await page.waitForTimeout(400);
     await clickText(page, 'Back Home');

@@ -20,6 +20,7 @@ import {
 } from 'react-native';
 import Svg, { Circle, Line } from 'react-native-svg';
 
+import { ScreenHeader } from '@/components/screen-header';
 import { useDashboardSync } from '@/hooks/useDashboardSync';
 import { API_BASE_URL } from '@/constants/apiBase';
 
@@ -100,7 +101,7 @@ const APP_SAFETY_NOTE =
 // app.json version isn't readable from inside the JS bundle without adding
 // expo-constants just for this one string), so bumping a release means
 // updating both by hand.
-const APP_VERSION = '0.1.0';
+const APP_VERSION = '0.1.1';
 
 // A real, append-only changelog. Each entry should describe what genuinely
 // shipped, in plain language a non-technical user would understand -- never
@@ -113,6 +114,17 @@ type WhatsNewEntry = {
   highlights: string[];
 };
 const WHATS_NEW_ENTRIES: WhatsNewEntry[] = [
+  {
+    version: '0.1.1',
+    date: 'October 2026',
+    highlights: [
+      'Every internal screen now has a back-to-Home button at the top, so you never have to scroll all the way down just to leave a screen.',
+      'Fixed a real scoring bug: Reach, Arm Raise, Walking, and Timed Up & Go smoothness/stability scores were computed from raw frame-to-frame motion without correcting for the video\'s actual frame rate, so the identical movement could score differently depending on whether it was recorded at 30fps, 60fps, or something else. These now use the same frame-rate correction the Rep/Arm-Curl scoring already had.',
+      'Hardened against corrupted video frame-rate metadata (rare, but seen on some phone recordings) so it can no longer silently skew a score.',
+      'Fixed two navigation bugs: the 2-Minute Reset screen could stay marked "open" after certain exits, and the first-time introduction had no way to skip past it.',
+      'Decluttered the Home screen: removed two buttons (History, Insights) that duplicated entry points already available just below the Start button.',
+    ],
+  },
   {
     version: '0.1.0',
     date: 'September 2026',
@@ -6345,6 +6357,7 @@ export default function HomeScreen() {
   const closeAllOverlays = () => {
     setShowHistory(false);
     setShowOnboarding(false);
+    setShowTwoMinuteReset(false);
     setShowTestingGuide(false);
     setShowFeedbackNotes(false);
     setShowCameraSetupGuide(false);
@@ -7550,6 +7563,15 @@ export default function HomeScreen() {
         <Pressable style={styles.mainButton} onPress={finishOnboarding}>
           <Text style={styles.buttonText}>Start Movement Check</Text>
         </Pressable>
+
+        <Pressable
+          style={styles.secondaryButton}
+          onPress={finishOnboarding}
+          accessibilityRole="button"
+          accessibilityLabel="Skip the introduction for now"
+        >
+          <Text style={styles.secondaryButtonText}>Skip for now</Text>
+        </Pressable>
       </ScrollView>
     );
   }
@@ -7614,6 +7636,7 @@ export default function HomeScreen() {
         contentContainerStyle={styles.testingGuideContent}
         showsVerticalScrollIndicator={false}
       >
+        <ScreenHeader onBack={() => setShowTestingGuide(false)} />
         <View style={styles.heroBadge}>
           <Text style={styles.heroBadgeText}>Private Testing</Text>
         </View>
@@ -7757,6 +7780,7 @@ export default function HomeScreen() {
         contentContainerStyle={styles.feedbackContent}
         showsVerticalScrollIndicator={false}
       >
+        <ScreenHeader onBack={() => setShowFeedbackNotes(false)} />
         <View style={styles.heroBadge}>
           <Text style={styles.heroBadgeText}>Tester Feedback</Text>
         </View>
@@ -8029,6 +8053,7 @@ export default function HomeScreen() {
         contentContainerStyle={styles.cameraSetupContent}
         showsVerticalScrollIndicator={false}
       >
+        <ScreenHeader onBack={() => setShowTransparency(false)} />
         <View style={styles.heroBadge}>
           <Text style={styles.heroBadgeText}>Transparency</Text>
         </View>
@@ -8121,6 +8146,7 @@ export default function HomeScreen() {
         contentContainerStyle={styles.cameraSetupContent}
         showsVerticalScrollIndicator={false}
       >
+        <ScreenHeader onBack={() => setShowWhatsNew(false)} />
         <View style={styles.heroBadge}>
           <Text style={styles.heroBadgeText}>What&apos;s New</Text>
         </View>
@@ -8169,6 +8195,7 @@ export default function HomeScreen() {
         contentContainerStyle={styles.cameraSetupContent}
         showsVerticalScrollIndicator={false}
       >
+        <ScreenHeader onBack={() => setShowSettings(false)} />
         <View style={styles.heroBadge}>
           <Text style={styles.heroBadgeText}>Settings</Text>
         </View>
@@ -8557,6 +8584,7 @@ export default function HomeScreen() {
         contentContainerStyle={styles.cameraSetupContent}
         showsVerticalScrollIndicator={false}
       >
+        <ScreenHeader onBack={() => setShowTeamRoster(false)} />
         <View style={styles.heroBadge}>
           <Text style={styles.heroBadgeText}>Team Screening</Text>
         </View>
@@ -8674,6 +8702,7 @@ export default function HomeScreen() {
         contentContainerStyle={styles.cameraSetupContent}
         showsVerticalScrollIndicator={false}
       >
+        <ScreenHeader onBack={() => setShowCameraSetupGuide(false)} />
         <View style={styles.heroBadge}>
           <Text style={styles.heroBadgeText}>Recording Setup</Text>
         </View>
@@ -8775,6 +8804,7 @@ export default function HomeScreen() {
         contentContainerStyle={styles.rolloutDashboardContent}
         showsVerticalScrollIndicator={false}
       >
+        <ScreenHeader onBack={() => setShowRolloutDashboard(false)} />
         <View style={styles.heroBadge}>
           <Text style={styles.heroBadgeText}>Rollout</Text>
         </View>
@@ -9130,6 +9160,7 @@ export default function HomeScreen() {
         contentContainerStyle={styles.guidedWorkflowContent}
         showsVerticalScrollIndicator={false}
       >
+        <ScreenHeader onBack={() => setShowGuidedTestWorkflow(false)} />
         <View style={styles.heroBadge}>
           <Text style={styles.heroBadgeText}>Private Beta</Text>
         </View>
@@ -9317,6 +9348,7 @@ export default function HomeScreen() {
         contentContainerStyle={styles.betaLaunchContent}
         showsVerticalScrollIndicator={false}
       >
+        <ScreenHeader onBack={() => setShowBetaLaunchKit(false)} />
         <View style={styles.heroBadge}>
           <Text style={styles.heroBadgeText}>Beta Launch</Text>
         </View>
@@ -9530,6 +9562,7 @@ export default function HomeScreen() {
         contentContainerStyle={styles.testerAnalyticsContent}
         showsVerticalScrollIndicator={false}
       >
+        <ScreenHeader onBack={() => setShowTesterAnalytics(false)} />
         <View style={styles.heroBadge}>
           <Text style={styles.heroBadgeText}>Tester Analytics</Text>
         </View>
@@ -9751,6 +9784,7 @@ export default function HomeScreen() {
         contentContainerStyle={styles.dailyHealthOverviewContent}
         showsVerticalScrollIndicator={false}
       >
+        <ScreenHeader onBack={() => setShowDailyHealthOverview(false)} />
         <View style={styles.heroBadge}>
           <Text style={styles.heroBadgeText}>Daily Health</Text>
         </View>
@@ -10034,6 +10068,11 @@ export default function HomeScreen() {
         contentContainerStyle={styles.cameraSetupContent}
         showsVerticalScrollIndicator={false}
       >
+        <ScreenHeader onBack={() => {
+              setShowTwoMinuteReset(false);
+              setResetRunning(false);
+              goToStep(0);
+            }} />
         <View style={styles.heroBadge}>
           <Text style={styles.heroBadgeText}>2-Minute Reset</Text>
         </View>
@@ -10127,6 +10166,10 @@ export default function HomeScreen() {
         contentContainerStyle={styles.checkInContent}
         showsVerticalScrollIndicator={false}
       >
+        <ScreenHeader onBack={() => {
+              setShowDailyCheckIn(false);
+              setCheckInSavedMessage(null);
+            }} />
         <View style={styles.heroBadge}>
           <Text style={styles.heroBadgeText}>Daily Check-In</Text>
         </View>
@@ -10263,6 +10306,7 @@ export default function HomeScreen() {
         contentContainerStyle={styles.checkInContent}
         showsVerticalScrollIndicator={false}
       >
+        <ScreenHeader onBack={() => setShowInsights(false)} />
         <View style={styles.heroBadge}>
           <Text style={styles.heroBadgeText}>Insights</Text>
         </View>
@@ -10339,6 +10383,7 @@ export default function HomeScreen() {
         contentContainerStyle={styles.builderToolsContent}
         showsVerticalScrollIndicator={false}
       >
+        <ScreenHeader onBack={() => setShowBuilderTools(false)} />
         <View style={styles.heroBadge}>
           <Text style={styles.heroBadgeText}>Builder Mode</Text>
         </View>
@@ -10603,6 +10648,7 @@ export default function HomeScreen() {
         contentContainerStyle={styles.reportExportContent}
         showsVerticalScrollIndicator={false}
       >
+        <ScreenHeader onBack={() => setShowReportExport(false)} />
         <View style={styles.heroBadge}>
           <Text style={styles.heroBadgeText}>Your Summary</Text>
         </View>
@@ -10958,6 +11004,7 @@ export default function HomeScreen() {
         contentContainerStyle={styles.aiCoachContent}
         showsVerticalScrollIndicator={false}
       >
+        <ScreenHeader onBack={() => setShowAiCoach(false)} />
         <View style={styles.heroBadge}>
           <Text style={styles.heroBadgeText}>AI Coach</Text>
         </View>
@@ -11221,6 +11268,7 @@ export default function HomeScreen() {
         contentContainerStyle={styles.weeklyReportContent}
         showsVerticalScrollIndicator={false}
       >
+        <ScreenHeader onBack={() => setShowWeeklyReport(false)} />
         <View style={styles.heroBadge}>
           <Text style={styles.heroBadgeText}>Weekly Report</Text>
         </View>
@@ -11501,6 +11549,7 @@ export default function HomeScreen() {
         contentContainerStyle={styles.mobilityProfileContent}
         showsVerticalScrollIndicator={false}
       >
+        <ScreenHeader onBack={() => setShowMobilityProfile(false)} />
         <View style={styles.heroBadge}>
           <Text style={styles.heroBadgeText}>Mobility Profile</Text>
         </View>
@@ -11778,6 +11827,7 @@ export default function HomeScreen() {
         contentContainerStyle={styles.serverDiagnosticsContent}
         showsVerticalScrollIndicator={false}
       >
+        <ScreenHeader onBack={() => setShowServerDiagnostics(false)} />
         <View style={styles.heroBadge}>
           <Text style={styles.heroBadgeText}>Backend</Text>
         </View>
@@ -11915,6 +11965,7 @@ export default function HomeScreen() {
         contentContainerStyle={styles.longitudinalContent}
         showsVerticalScrollIndicator={false}
       >
+        <ScreenHeader onBack={() => setShowTrendEngine(false)} />
         <View style={styles.heroBadge}>
           <Text style={styles.heroBadgeText}>Trend Engine</Text>
         </View>
@@ -12176,6 +12227,7 @@ export default function HomeScreen() {
         contentContainerStyle={styles.guidedOnboardingContent}
         showsVerticalScrollIndicator={false}
       >
+        <ScreenHeader onBack={() => setShowGuidedOnboarding(false)} />
         <View style={styles.heroBadge}>
           <Text style={styles.heroBadgeText}>Start Here</Text>
         </View>
@@ -12390,6 +12442,7 @@ export default function HomeScreen() {
         contentContainerStyle={styles.yoloFrameworkContent}
         showsVerticalScrollIndicator={false}
       >
+        <ScreenHeader onBack={() => setShowYoloFramework(false)} />
         <View style={styles.heroBadge}>
           <Text style={styles.heroBadgeText}>YOLO Framework</Text>
         </View>
@@ -12595,6 +12648,7 @@ export default function HomeScreen() {
         contentContainerStyle={styles.historyContent}
         showsVerticalScrollIndicator={false}
       >
+        <ScreenHeader onBack={() => setShowHistory(false)} />
         <View style={styles.heroBadge}>
           <Text style={styles.heroBadgeText}>Movement History</Text>
         </View>
@@ -12988,14 +13042,6 @@ export default function HomeScreen() {
                   {hasCheckedInToday(checkIns) ? 'Update Check-In' : 'Check In Now'}
                 </Text>
               </Pressable>
-              {checkIns.length >= 2 ? (
-                <Pressable
-                  style={styles.checkInHomeSecondaryButton}
-                  onPress={() => setShowInsights(true)}
-                >
-                  <Text style={styles.secondaryButtonText}>Insights</Text>
-                </Pressable>
-              ) : null}
             </View>
           </View>
 
@@ -13037,13 +13083,6 @@ export default function HomeScreen() {
               </View>
 
               <View style={styles.savedSessionButtonRow}>
-                <Pressable
-                  style={styles.viewHistoryButton}
-                  onPress={() => setShowHistory(true)}
-                >
-                  <Text style={styles.viewHistoryButtonText}>View History</Text>
-                </Pressable>
-
                 <Pressable style={styles.clearHistoryButton} onPress={clearSavedSessions}>
                   <Text style={styles.clearHistoryButtonText}>Clear Saved Checks</Text>
                 </Pressable>

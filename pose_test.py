@@ -1172,7 +1172,7 @@ def build_sit_to_stand_insights(task_analysis):
 # -----------------------------
 
 
-def summarize_reach_task(task_signal_data, total_frames):
+def summarize_reach_task(task_signal_data, total_frames, fps: float = 30.0):
 
     distances = task_signal_data["reach_distances"]
 
@@ -1189,7 +1189,13 @@ def summarize_reach_task(task_signal_data, total_frames):
 
     reach_range = reach_distance_max - reach_distance_min
 
-    reach_smoothness = float(np.std(np.diff(reach_array)))
+    # See REFERENCE_FPS further down this file: a raw per-frame difference
+    # is deg/frame (or, here, distance/frame), not a true rate, so it has
+    # to be rescaled to "as if this were a 30fps recording" before being
+    # judged against thresholds tuned at 30fps. At exactly 30fps this is a
+    # no-op, same as everywhere else this pattern is used.
+    fps_scale = (fps / 30.0) if fps else 1.0
+    reach_smoothness = float(np.std(np.diff(reach_array) * fps_scale))
 
     endpoint_window = reach_array[-10:] if len(
         reach_array) >= 10 else reach_array
@@ -1286,7 +1292,7 @@ def build_reach_insights(task_analysis):
 # -----------------------------
 
 
-def summarize_arm_raise_task(task_signal_data, total_frames):
+def summarize_arm_raise_task(task_signal_data, total_frames, fps: float = 30.0):
 
     vertical_positions = task_signal_data["arm_raise_vertical_positions"]
     distances = task_signal_data["arm_raise_distances"]
@@ -1309,7 +1315,10 @@ def summarize_arm_raise_task(task_signal_data, total_frames):
     raise_min = float(np.min(vertical_array))
     raise_range = raise_max - raise_min
 
-    arm_raise_smoothness = float(np.std(np.diff(vertical_array)))
+    # See REFERENCE_FPS further down this file -- same frame-rate
+    # normalization as reach_smoothness / step_rhythm_variability above.
+    fps_scale = (fps / 30.0) if fps else 1.0
+    arm_raise_smoothness = float(np.std(np.diff(vertical_array) * fps_scale))
 
     # Look near the highest raised position, not just the final frames.
     top_index = int(np.argmax(vertical_array))
@@ -1518,8 +1527,11 @@ def summarize_walking_task(task_signal_data, total_frames, fps: float = 30.0):
 
     hip_path_range = float(np.max(hip_x_array) - np.min(hip_x_array))
     hip_vertical_variability = float(np.std(hip_y_array))
+    # See REFERENCE_FPS further down this file -- fps was already threaded
+    # into this function (for duration_sec above) but wasn't applied here.
+    fps_scale = (fps / 30.0) if fps else 1.0
     step_rhythm_variability = float(
-        np.std(np.diff(step_array))) if len(step_array) > 2 else None
+        np.std(np.diff(step_array) * fps_scale)) if len(step_array) > 2 else None
 
     left_knee_range = None
     right_knee_range = None
@@ -1885,7 +1897,7 @@ def build_balance_insights(task_analysis):
 # -----------------------------
 
 
-def count_direction_changes(signal, min_change=0.02):
+def count_direction_changes(signal, min_change=0.02, fps_scale=1.0):
     if len(signal) < 8:
         return 0
 
@@ -1896,7 +1908,10 @@ def count_direction_changes(signal, min_change=0.02):
     for i in range(1, len(smoothed)):
         if smoothed[i] is None or smoothed[i - 1] is None:
             continue
-        diffs.append(smoothed[i] - smoothed[i - 1])
+        # See REFERENCE_FPS further down this file -- without this, the
+        # fixed min_change threshold below is only correctly calibrated at
+        # 30fps.
+        diffs.append((smoothed[i] - smoothed[i - 1]) * fps_scale)
 
     if len(diffs) < 5:
         return 0
@@ -1985,7 +2000,9 @@ def summarize_tug_task(task_signal_data, total_frames, fps: float = 30.0):
     tug_path_range = float(np.max(hip_x_array) - np.min(hip_x_array))
     tug_hip_vertical_variability = float(np.std(hip_y_array))
 
-    tug_direction_changes = count_direction_changes(hip_x)
+    tug_fps_scale = (fps / 30.0) if fps else 1.0
+    tug_direction_changes = count_direction_changes(
+        hip_x, fps_scale=tug_fps_scale)
     tug_return_pattern_detected = tug_direction_changes >= 1 and tug_path_range > 0.08
 
     tug_estimated_step_cycles = count_step_cycles(step_signal)
@@ -2289,6 +2306,16 @@ def run_analysis(video_path, mode="rep", daily_task="reach", output_csv="elbow_a
             fps = 30.0
 
         fps = float(fps)
+
+        # Guard against bogus container metadata (seen in the wild on some
+        # VFR-encoded phone recordings): a fps reading outside a sane
+        # camera range would otherwise silently corrupt fps_scale below and
+        # every smoothness/stability score derived from it, with no error
+        # of any kind. 1-120fps comfortably covers every real camera this
+        # app records from (including 120fps slow-mo); anything outside
+        # that is treated the same as a missing reading.
+        if not (1.0 <= fps <= 120.0):
+            fps = 30.0
 
         if not cap.isOpened():
             raise RuntimeError(f"Could not open video: {video_path}")
@@ -2943,7 +2970,8 @@ def run_analysis(video_path, mode="rep", daily_task="reach", output_csv="elbow_a
         elif mode == "daily" and daily_task == "reach":
             task_analysis: Dict[str, Any] = summarize_reach_task(
                 task_signal_data,
-                len(angle_data)
+                len(angle_data),
+                fps
             )
 
             task_analysis["task_insights"] = build_reach_insights(
@@ -2955,7 +2983,8 @@ def run_analysis(video_path, mode="rep", daily_task="reach", output_csv="elbow_a
         elif mode == "daily" and daily_task == "arm_raise":
             task_analysis: Dict[str, Any] = summarize_arm_raise_task(
                 task_signal_data,
-                len(angle_data)
+                len(angle_data),
+                fps
             )
 
             task_analysis["task_insights"] = build_arm_raise_insights(
