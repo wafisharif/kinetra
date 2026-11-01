@@ -99,8 +99,8 @@ test.describe('Kinetra regression suite', () => {
   test('home renders with saved sessions and nav chips', async ({ page }) => {
     const text = await page.locator('body').innerText();
     expect(text).toContain('Kinetra');
-    expect(text).toContain('Your Summary');
     expect(text).toContain('Settings');
+    expect(text).toContain('Explore');
     // Regression check: confirms the feature-preview text for the current
     // default mode ('daily', since the "declutter navigation, broaden
     // appeal" redesign made Daily Movement Health the default experience
@@ -109,6 +109,19 @@ test.describe('Kinetra regression suite', () => {
     // moved behind "Show Advanced Options" in that same redesign -- see the
     // "team roster" test above for the same collapsed-by-default pattern.
     expect(text).toContain('Stability, control, efficiency, and daily movement quality.');
+
+    // "Your Summary" (along with How It Works, Camera Setup, Weekly
+    // Report, Mobility Profile, and Privacy & Transparency) is collapsed
+    // behind the "More" chip as of the tile-card Home redesign -- same
+    // collapsed-by-default pattern as "Show Advanced Options" above.
+    // Shouldn't be in the initial render, but should appear once expanded.
+    expect(text).not.toContain('Your Summary');
+    expect(text).toContain('More');
+
+    await clickText(page, 'More');
+    await page.waitForTimeout(300);
+    const expandedText = await page.locator('body').innerText();
+    expect(expandedText).toContain('Your Summary');
   });
 
   test('team roster shows athletes and flags the poor grade', async ({ page }) => {
@@ -141,6 +154,9 @@ test.describe('Kinetra regression suite', () => {
   });
 
   test('transparency screen renders', async ({ page }) => {
+    // "Privacy & Transparency" lives behind the "More" chip now.
+    await clickText(page, 'More');
+    await page.waitForTimeout(300);
     await clickText(page, 'Transparency');
     await page.waitForTimeout(600);
     const text = await page.locator('body').innerText();
@@ -162,6 +178,9 @@ test.describe('Kinetra regression suite', () => {
     // instead of wrapping it. Assert the text elements stay within bounds
     // at a narrow (375px) viewport, where the bug was originally caught.
     await page.setViewportSize({ width: 375, height: 800 });
+    // "Mobility Profile" lives behind the "More" chip now.
+    await clickText(page, 'More');
+    await page.waitForTimeout(300);
     await clickText(page, 'Mobility Profile');
     await page.waitForTimeout(600);
 
@@ -181,6 +200,9 @@ test.describe('Kinetra regression suite', () => {
 
   test('Movement Passport highlight cards wrap their text instead of clipping it', async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 800 });
+    // "Your Summary" lives behind the "More" chip now.
+    await clickText(page, 'More');
+    await page.waitForTimeout(300);
     await clickText(page, 'Your Summary');
     await page.waitForTimeout(600);
 
