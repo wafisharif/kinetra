@@ -6392,6 +6392,13 @@ export default function HomeScreen() {
   const [showAdvancedOptions, setShowAdvancedOptions] = useState(false);
   const [showDeveloperTools, setShowDeveloperTools] = useState(false);
 
+  // Redesign, round 3: the Home screen's "Explore"/"More" rows were two
+  // long strips of pill buttons. This collapses the secondary "More"
+  // destinations (How It Works, Camera Setup, Your Summary, Weekly Report,
+  // Mobility Profile, Privacy & Transparency) behind one tap -- same
+  // pattern as `showAdvancedOptions` above.
+  const [showMoreLinks, setShowMoreLinks] = useState(false);
+
   // Redesign, round 2: a one-time "why are you here" question for a brand
   // new user. This isn't cosmetic -- `userGoal` genuinely changes what the
   // home screen suggests first (see getSuggestedFirstAction below), so
@@ -13548,107 +13555,163 @@ export default function HomeScreen() {
           </Pressable>
 
           <Text style={[styles.sectionTitle, { marginTop: 28 }]}>Explore</Text>
-          <View style={styles.savedSessionButtonRow}>
+          <View style={styles.homeTileGrid}>
             <Pressable
-              style={styles.viewHistoryButton}
+              style={styles.homeTile}
               onPress={() => {
                 closeAllOverlays();
                 setShowTwoMinuteReset(true);
               }}
+              accessibilityRole="button"
+              accessibilityLabel="2-Minute Reset"
+              accessibilityHint="Opens a short guided reset. No score, no video."
             >
-              <Text style={styles.viewHistoryButtonText}>2-Minute Reset</Text>
+              <Text style={styles.homeTileTitle}>2-Minute Reset</Text>
+              <Text style={styles.homeTileText}>A couple minutes back for you -- no score, no video.</Text>
             </Pressable>
+
             <Pressable
-              style={styles.viewHistoryButton}
+              style={styles.homeTile}
               onPress={() => {
                 closeAllOverlays();
                 setShowHistory(true);
               }}
+              accessibilityRole="button"
+              accessibilityLabel="History"
+              accessibilityHint="Opens your saved checks and how they've changed over time."
             >
-              <Text style={styles.viewHistoryButtonText}>History</Text>
+              <Text style={styles.homeTileTitle}>History</Text>
+              <Text style={styles.homeTileText}>Saved checks, compared with baseline over time.</Text>
             </Pressable>
+
             <Pressable
-              style={styles.viewHistoryButton}
+              style={styles.homeTile}
               onPress={() => {
                 closeAllOverlays();
                 setShowInsights(true);
               }}
+              accessibilityRole="button"
+              accessibilityLabel="Insights"
+              accessibilityHint="Opens patterns found across your check-ins and movement checks."
             >
-              <Text style={styles.viewHistoryButtonText}>Insights</Text>
+              <Text style={styles.homeTileTitle}>Insights</Text>
+              <Text style={styles.homeTileText}>Patterns across your check-ins, computed on your device.</Text>
             </Pressable>
+
             <Pressable
-              style={styles.viewHistoryButton}
+              style={styles.homeTile}
               onPress={() => {
                 closeAllOverlays();
                 setShowAiCoach(true);
               }}
+              accessibilityRole="button"
+              accessibilityLabel="AI Coach"
+              accessibilityHint="Opens a plain-English explanation of your movement profile."
             >
-              <Text style={styles.viewHistoryButtonText}>AI Coach</Text>
+              <Text style={styles.homeTileTitle}>AI Coach</Text>
+              <Text style={styles.homeTileText}>A plain-English read on your profile, and what to record next.</Text>
             </Pressable>
           </View>
 
-          <Text style={[styles.sectionTitle, { marginTop: 20 }]}>More</Text>
-          <View style={styles.publicHomeTopActions}>
-            <Pressable
-              style={styles.howItWorksButton}
-              onPress={() => {
-                closeAllOverlays();
-                setShowOnboarding(true);
-              }}
-            >
-              <Text style={styles.howItWorksButtonText}>How It Works</Text>
-            </Pressable>
+          <Pressable
+            style={[styles.dailyTaskChip, { flex: 0, alignSelf: 'flex-start', paddingHorizontal: 14, marginTop: 20 }]}
+            onPress={() => setShowMoreLinks(!showMoreLinks)}
+            accessibilityRole="button"
+            accessibilityLabel="More"
+            accessibilityState={{ expanded: showMoreLinks }}
+          >
+            <Text style={styles.dailyTaskChipText}>
+              {showMoreLinks ? 'Hide More' : 'More'}
+            </Text>
+          </Pressable>
 
-            <Pressable
-              style={styles.howItWorksButton}
-              onPress={() => {
-                closeAllOverlays();
-                setShowCameraSetupGuide(true);
-              }}
-            >
-              <Text style={styles.howItWorksButtonText}>Camera Setup</Text>
-            </Pressable>
+          {showMoreLinks ? (
+            <View style={[styles.homeTileGrid, { marginTop: 12 }]}>
+              <Pressable
+                style={[styles.homeTile, styles.homeTileSecondary]}
+                onPress={() => {
+                  closeAllOverlays();
+                  setShowOnboarding(true);
+                }}
+                accessibilityRole="button"
+                accessibilityLabel="How It Works"
+                accessibilityHint="Opens a quick walkthrough of what Kinetra checks and how."
+              >
+                <Text style={styles.homeTileTitle}>How It Works</Text>
+                <Text style={styles.homeTileText}>A quick walkthrough of what Kinetra checks and how.</Text>
+              </Pressable>
 
-            <Pressable
-              style={styles.howItWorksButton}
-              onPress={() => {
-                closeAllOverlays();
-                setShowReportExport(true);
-              }}
-            >
-              <Text style={styles.howItWorksButtonText}>Your Summary</Text>
-            </Pressable>
+              <Pressable
+                style={[styles.homeTile, styles.homeTileSecondary]}
+                onPress={() => {
+                  closeAllOverlays();
+                  setShowCameraSetupGuide(true);
+                }}
+                accessibilityRole="button"
+                accessibilityLabel="Camera Setup"
+                accessibilityHint="Opens tips for setting up your camera before recording."
+              >
+                <Text style={styles.homeTileTitle}>Camera Setup</Text>
+                <Text style={styles.homeTileText}>Set up your camera so recordings track clearly.</Text>
+              </Pressable>
 
-            <Pressable
-              style={styles.howItWorksButton}
-              onPress={() => {
-                closeAllOverlays();
-                setShowWeeklyReport(true);
-              }}
-            >
-              <Text style={styles.howItWorksButtonText}>Weekly Report</Text>
-            </Pressable>
+              <Pressable
+                style={[styles.homeTile, styles.homeTileSecondary]}
+                onPress={() => {
+                  closeAllOverlays();
+                  setShowReportExport(true);
+                }}
+                accessibilityRole="button"
+                accessibilityLabel="Your Summary"
+                accessibilityHint="Opens a shareable snapshot of your trends and next steps."
+              >
+                <Text style={styles.homeTileTitle}>Your Summary</Text>
+                <Text style={styles.homeTileText}>A shareable snapshot of your trends and next step.</Text>
+              </Pressable>
 
-            <Pressable
-              style={styles.howItWorksButton}
-              onPress={() => {
-                closeAllOverlays();
-                setShowMobilityProfile(true);
-              }}
-            >
-              <Text style={styles.howItWorksButtonText}>Mobility Profile</Text>
-            </Pressable>
+              <Pressable
+                style={[styles.homeTile, styles.homeTileSecondary]}
+                onPress={() => {
+                  closeAllOverlays();
+                  setShowWeeklyReport(true);
+                }}
+                accessibilityRole="button"
+                accessibilityLabel="Weekly Report"
+                accessibilityHint="Opens your last 7 days and what to focus on next."
+              >
+                <Text style={styles.homeTileTitle}>Weekly Report</Text>
+                <Text style={styles.homeTileText}>Your last 7 days, and what to focus on next.</Text>
+              </Pressable>
 
-            <Pressable
-              style={styles.howItWorksButton}
-              onPress={() => {
-                closeAllOverlays();
-                setShowTransparency(true);
-              }}
-            >
-              <Text style={styles.howItWorksButtonText}>Privacy & Transparency</Text>
-            </Pressable>
-          </View>
+              <Pressable
+                style={[styles.homeTile, styles.homeTileSecondary]}
+                onPress={() => {
+                  closeAllOverlays();
+                  setShowMobilityProfile(true);
+                }}
+                accessibilityRole="button"
+                accessibilityLabel="Mobility Profile"
+                accessibilityHint="Opens your combined mobility profile across control, gait, and balance."
+              >
+                <Text style={styles.homeTileTitle}>Mobility Profile</Text>
+                <Text style={styles.homeTileText}>Control, gait, balance, and mobility in one profile.</Text>
+              </Pressable>
+
+              <Pressable
+                style={[styles.homeTile, styles.homeTileSecondary]}
+                onPress={() => {
+                  closeAllOverlays();
+                  setShowTransparency(true);
+                }}
+                accessibilityRole="button"
+                accessibilityLabel="Privacy and Transparency"
+                accessibilityHint="Opens how Kinetra measures movement and what it does with your data."
+              >
+                <Text style={styles.homeTileTitle}>Privacy & Transparency</Text>
+                <Text style={styles.homeTileText}>How Kinetra actually measures movement, and your data.</Text>
+              </Pressable>
+            </View>
+          ) : null}
         </ScrollView>
       ) : videoUri ? (
         <View style={styles.fullScreen}>
@@ -19460,6 +19523,41 @@ const styles = StyleSheet.create({
     color: '#cbd5e1',
     fontSize: 12,
     fontWeight: '800',
+  },
+
+  homeTileGrid: {
+    width: '100%',
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+  },
+
+  homeTile: {
+    width: '47%',
+    backgroundColor: 'rgba(30, 41, 59, 0.9)',
+    borderWidth: 1,
+    borderColor: 'rgba(148, 163, 184, 0.14)',
+    borderRadius: 16,
+    padding: 14,
+    minHeight: 86,
+  },
+
+  homeTileSecondary: {
+    backgroundColor: 'rgba(30, 41, 59, 0.55)',
+    borderColor: 'rgba(148, 163, 184, 0.1)',
+  },
+
+  homeTileTitle: {
+    color: '#ffffff',
+    fontSize: 14,
+    fontWeight: '700',
+    marginBottom: 4,
+  },
+
+  homeTileText: {
+    color: '#94a3b8',
+    fontSize: 12,
+    lineHeight: 16,
   },
 
   unreadDot: {
