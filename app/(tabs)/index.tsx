@@ -424,6 +424,191 @@ const TWO_MINUTE_RESET_STEPS: TwoMinuteResetStep[] = [
   },
 ];
 
+// ===== Quick Tests: Finger Tapping, 4-Meter Walk, Dual-Task Walk =========
+// Recommended by Dr. Rao (external clinical advisor) as lightweight,
+// research-inspired motor/mobility screens. Like the 2-Minute Reset above,
+// these live entirely outside the camera/pose-analysis pipeline -- no
+// video, no MediaPipe, no backend call. Each one's math is a direct,
+// deliberately simple implementation of a published protocol, not a
+// derived or fuzzy score, so every number it shows can be checked by hand:
+//   - Finger Tapping: tap rate / rhythm / fatigue metrics modeled on the
+//     CAPSIT-PD timed tapping test protocol used in Parkinson's
+//     bradykinesia research (10s per hand; Lee et al. 2016, PLoS ONE,
+//     "A Validation Study of a Smartphone-Based Finger Tapping
+//     Application for Quantitative Assessment of Bradykinesia").
+//   - 4-Meter Walk: gait speed = known distance (4 m) / measured time,
+//     the standard clinical 4-Meter Walk Test protocol (e.g. Nguyen et
+//     al. 2022, IJERPH, "Walking Speed Assessed by 4-Meter Walk Test in
+//     the Community-Dwelling Oldest Old") -- the same test used in
+//     frailty-screening batteries, just timed with a phone instead of a
+//     stopwatch.
+//   - Dual-Task Walk: the same 4-meter walk, once alone and once while
+//     counting out loud, compared with the Dual-Task Gait Cost formula
+//     from the Canadian Consortium on Neurodegeneration in Aging's
+//     national gait-assessment guidelines (Cullen et al. 2018: "DTGC =
+//     [(usual gait - dual-task gait) / usual gait] x 100").
+// None of these are diagnostic -- they're descriptive, same as every
+// other check in the app -- see Privacy & Transparency.
+
+type FingerTappingHand = 'right' | 'left';
+
+type FingerTappingHandResult = {
+  hand: FingerTappingHand;
+  tapCount: number;
+  durationSeconds: number;
+  tapRateHz: number;
+  meanIntervalMs: number;
+  rhythmCV: number;
+  decrementPercent: number;
+};
+
+type FingerTappingSession = {
+  id: string;
+  timestamp: string;
+  hands: FingerTappingHandResult[];
+  asymmetryPercent: number | null;
+};
+
+const FINGER_TAPPING_DURATION_SECONDS = 10;
+
+// Computes every Finger Tapping metric from raw tap timestamps (ms, each
+// relative to the start of that hand's window). This is the only place
+// that touches the raw numbers -- the UI and storage layers only ever see
+// the FingerTappingHandResult this returns.
+function computeFingerTappingHandResult(
+  hand: FingerTappingHand,
+  tapTimestampsMs: number[],
+  durationSeconds: number
+): FingerTappingHandResult {
+  const tapCount = tapTimestampsMs.length;
+  const tapRateHz = durationSeconds > 0 ? tapCount / durationSeconds : 0;
+
+  const intervals: number[] = [];
+  for (let i = 1; i < tapTimestampsMs.length; i++) {
+    intervals.push(tapTimestampsMs[i] - tapTimestampsMs[i - 1]);
+  }
+  const meanIntervalMs =
+    intervals.length > 0 ? intervals.reduce((sum, v) => sum + v, 0) / intervals.length : 0;
+
+  let rhythmCV = 0;
+  if (intervals.length > 1 && meanIntervalMs > 0) {
+    const variance =
+      intervals.reduce((sum, v) => sum + (v - meanIntervalMs) ** 2, 0) / intervals.length;
+    rhythmCV = (Math.sqrt(variance) / meanIntervalMs) * 100;
+  }
+
+  // Fatigue/decrement: tap rate in the first half of the window vs. the
+  // second half, split by wall-clock time (not tap index), matching how
+  // tapping decrement is assessed in the literature this is modeled on.
+  const halfWindowMs = (durationSeconds * 1000) / 2;
+  const firstHalfCount = tapTimestampsMs.filter((t) => t < halfWindowMs).length;
+  const secondHalfCount = tapCount - firstHalfCount;
+  const halfWindowSeconds = durationSeconds / 2;
+  const firstHalfRate = halfWindowSeconds > 0 ? firstHalfCount / halfWindowSeconds : 0;
+  const secondHalfRate = halfWindowSeconds > 0 ? secondHalfCount / halfWindowSeconds : 0;
+  const decrementPercent =
+    firstHalfRate > 0 ? ((firstHalfRate - secondHalfRate) / firstHalfRate) * 100 : 0;
+
+  return { hand, tapCount, durationSeconds, tapRateHz, meanIntervalMs, rhythmCV, decrementPercent };
+}
+
+// Symmetric asymmetry index from the CAPSIT-PD tapping literature:
+// 100 x (better - worse) / (better + worse), where "better" is whichever
+// hand's tap rate is higher. Bounded 0-100 by construction.
+function computeTappingAsymmetryPercent(rightRateHz: number, leftRateHz: number): number {
+  const better = Math.max(rightRateHz, leftRateHz);
+  const worse = Math.min(rightRateHz, leftRateHz);
+  if (better + worse === 0) return 0;
+  return (100 * (better - worse)) / (better + worse);
+}
+
+type FourMeterWalkSession = {
+  id: string;
+  timestamp: string;
+  elapsedSeconds: number;
+  speedMps: number;
+};
+
+const FOUR_METER_WALK_DISTANCE_M = 4;
+
+// Gait speed = known distance / measured time -- the entire 4-Meter Walk
+// Test protocol. No pose estimation, no video: the distance is fixed by
+// how the person measured out their walking path, and the time is a
+// plain stopwatch reading (first-step to finish-line, same as the
+// clinical protocol).
+function computeGaitSpeedMps(elapsedSeconds: number): number {
+  if (elapsedSeconds <= 0) return 0;
+  return FOUR_METER_WALK_DISTANCE_M / elapsedSeconds;
+}
+
+type GaitSpeedBand = 'typical' | 'borderline' | 'slow';
+
+// Bands drawn directly from the 4-Meter Walk Test literature: <0.8 m/s is
+// the cut-point most consistently associated with higher fall/frailty
+// risk across studies; >=1.0 m/s sits within the commonly reported
+// typical range for community-dwelling adults. These are research
+// associations, not a diagnosis -- framed that way everywhere they show.
+function getGaitSpeedBand(speedMps: number): GaitSpeedBand {
+  if (speedMps >= 1.0) return 'typical';
+  if (speedMps >= 0.8) return 'borderline';
+  return 'slow';
+}
+
+function getGaitSpeedBandLabel(band: GaitSpeedBand): string {
+  if (band === 'typical') return 'Typical range';
+  if (band === 'borderline') return 'Borderline';
+  return 'Below 0.8 m/s';
+}
+
+// Same bg/border/text palette the rest of the app uses for grade colors
+// (see getGradeColors) -- its own small function instead of routing
+// speed bands through getGradeColors, since that function matches on
+// specific grade phrases already used elsewhere and a gait-speed band
+// isn't one of them.
+function getGaitSpeedBandColors(band: GaitSpeedBand) {
+  if (band === 'typical') {
+    return { bg: 'rgba(21, 128, 61, 0.18)', border: 'rgba(34, 197, 94, 0.45)', text: '#86efac' };
+  }
+  if (band === 'borderline') {
+    return { bg: 'rgba(161, 98, 7, 0.18)', border: 'rgba(250, 204, 21, 0.45)', text: '#fde68a' };
+  }
+  return { bg: 'rgba(127, 29, 29, 0.18)', border: 'rgba(248, 113, 113, 0.45)', text: '#fca5a5' };
+}
+
+type DualTaskCognitiveTask = 'counting_backward' | 'naming_animals';
+
+type DualTaskWalkSession = {
+  id: string;
+  timestamp: string;
+  cognitiveTask: DualTaskCognitiveTask;
+  plainElapsedSeconds: number;
+  plainSpeedMps: number;
+  dualElapsedSeconds: number;
+  dualSpeedMps: number;
+  dualTaskCostPercent: number;
+};
+
+// Dual-Task Gait Cost, exactly as defined in the Canadian Consortium on
+// Neurodegeneration in Aging's gait-assessment guidelines: DTGC =
+// [(usual gait - dual-task gait) / usual gait] x 100. Positive means
+// slower while dual-tasking (the expected direction); zero or negative
+// means the dual-task walk was no slower than the plain one.
+function computeDualTaskCostPercent(plainSpeedMps: number, dualSpeedMps: number): number {
+  if (plainSpeedMps <= 0) return 0;
+  return ((plainSpeedMps - dualSpeedMps) / plainSpeedMps) * 100;
+}
+
+function getDualTaskCognitiveTaskLabel(task: DualTaskCognitiveTask): string {
+  return task === 'counting_backward' ? 'Counting Backward by 3s' : 'Naming Animals';
+}
+
+function getDualTaskCognitiveTaskInstruction(task: DualTaskCognitiveTask, startNumber: number): string {
+  if (task === 'counting_backward') {
+    return `Start at ${startNumber} and count backward by 3s out loud (${startNumber}, ${startNumber - 3}, ${startNumber - 6}...) the whole way across.`;
+  }
+  return 'Say a different animal out loud with every step, the whole way across.';
+}
+
 function getSuggestedFirstAction(goal: UserGoal | null): {
   eyebrow: string;
   title: string;
@@ -6381,6 +6566,9 @@ export default function HomeScreen() {
     setShowServerDiagnostics(false);
     setShowDailyCheckIn(false);
     setShowInsights(false);
+    setShowFingerTapping(false);
+    setShowFourMeterWalk(false);
+    setShowDualTaskWalk(false);
   };
 
   // Redesign: the home screen used to show every destination (including
@@ -6398,6 +6586,45 @@ export default function HomeScreen() {
   // Mobility Profile, Privacy & Transparency) behind one tap -- same
   // pattern as `showAdvancedOptions` above.
   const [showMoreLinks, setShowMoreLinks] = useState(false);
+  // "Quick Tests" (round 4): Finger Tapping, 4-Meter Walk, and Dual-Task
+  // Walk -- recommended by Dr. Rao as lightweight, research-inspired
+  // motor/mobility screens. Same "no camera, nothing automatically
+  // inferred" spirit as 2-Minute Reset above, but these DO get saved
+  // (their own AsyncStorage keys -- see loadFingerTappingSessions etc.
+  // below) since tracking change across repeated sessions is the entire
+  // point of a motor-speed/gait-speed screen, unlike the Reset, which has
+  // no tracked value.
+  const [showFingerTapping, setShowFingerTapping] = useState(false);
+  const [fingerTappingSessions, setFingerTappingSessions] = useState<FingerTappingSession[]>([]);
+  const [tappingPhase, setTappingPhase] = useState<'intro' | 'running' | 'hand_done' | 'session_done'>('intro');
+  const [tappingHandIndex, setTappingHandIndex] = useState<0 | 1>(0); // 0 = right, 1 = left
+  const [tappingTaps, setTappingTaps] = useState<number[]>([]);
+  const [tappingSecondsLeft, setTappingSecondsLeft] = useState(FINGER_TAPPING_DURATION_SECONDS);
+  const [tappingRunning, setTappingRunning] = useState(false);
+  const [tappingStartMs, setTappingStartMs] = useState<number | null>(null);
+  const [tappingHandResults, setTappingHandResults] = useState<FingerTappingHandResult[]>([]);
+
+  const [showFourMeterWalk, setShowFourMeterWalk] = useState(false);
+  const [fourMeterWalkSessions, setFourMeterWalkSessions] = useState<FourMeterWalkSession[]>([]);
+  const [walkRunning, setWalkRunning] = useState(false);
+  const [walkStartMs, setWalkStartMs] = useState<number | null>(null);
+  const [walkTick, setWalkTick] = useState(0); // a simple once-per-second counter shown as the live "elapsed" display while walkRunning; the saved result always comes from a fresh Date.now() read at Stop, never from this counter, so a second of display lag here never affects the saved number
+  const [walkLastResult, setWalkLastResult] = useState<FourMeterWalkSession | null>(null);
+  const [walkComparisonPercent, setWalkComparisonPercent] = useState<number | null>(null);
+
+  const [showDualTaskWalk, setShowDualTaskWalk] = useState(false);
+  const [dualTaskWalkSessions, setDualTaskWalkSessions] = useState<DualTaskWalkSession[]>([]);
+  const [dualTaskPhase, setDualTaskPhase] = useState<
+    'pick_task' | 'plain_ready' | 'plain_running' | 'plain_done' | 'dual_ready' | 'dual_running' | 'dual_done'
+  >('pick_task');
+  const [dualTaskCognitive, setDualTaskCognitive] = useState<DualTaskCognitiveTask>('counting_backward');
+  const [dualTaskStartNumber, setDualTaskStartNumber] = useState(70);
+  const [dualTaskRunning, setDualTaskRunning] = useState(false);
+  const [dualTaskStartMs, setDualTaskStartMs] = useState<number | null>(null);
+  const [dualTaskTick, setDualTaskTick] = useState(0); // same once-per-second display counter as walkTick above
+  const [dualTaskPlainResult, setDualTaskPlainResult] = useState<{ elapsedSeconds: number; speedMps: number } | null>(null);
+  const [dualTaskFinalResult, setDualTaskFinalResult] = useState<DualTaskWalkSession | null>(null);
+
 
   // Redesign, round 2: a one-time "why are you here" question for a brand
   // new user. This isn't cosmetic -- `userGoal` genuinely changes what the
@@ -6461,6 +6688,66 @@ export default function HomeScreen() {
       setCheckIns(Array.isArray(parsed) ? parsed : []);
     } catch (error) {
       console.log('Failed to load daily check-ins:', error);
+    }
+  };
+
+  const loadFingerTappingSessions = async () => {
+    try {
+      const raw = await AsyncStorage.getItem('finger_tapping_sessions_v1');
+      const parsed = raw ? JSON.parse(raw) : [];
+      setFingerTappingSessions(Array.isArray(parsed) ? parsed : []);
+    } catch (error) {
+      console.log('Failed to load finger tapping sessions:', error);
+    }
+  };
+
+  const saveFingerTappingSession = async (session: FingerTappingSession) => {
+    const updated = [...fingerTappingSessions, session];
+    setFingerTappingSessions(updated);
+    try {
+      await AsyncStorage.setItem('finger_tapping_sessions_v1', JSON.stringify(updated));
+    } catch (error) {
+      console.log('Failed to save finger tapping session:', error);
+    }
+  };
+
+  const loadFourMeterWalkSessions = async () => {
+    try {
+      const raw = await AsyncStorage.getItem('four_meter_walk_sessions_v1');
+      const parsed = raw ? JSON.parse(raw) : [];
+      setFourMeterWalkSessions(Array.isArray(parsed) ? parsed : []);
+    } catch (error) {
+      console.log('Failed to load 4-meter walk sessions:', error);
+    }
+  };
+
+  const saveFourMeterWalkSession = async (session: FourMeterWalkSession) => {
+    const updated = [...fourMeterWalkSessions, session];
+    setFourMeterWalkSessions(updated);
+    try {
+      await AsyncStorage.setItem('four_meter_walk_sessions_v1', JSON.stringify(updated));
+    } catch (error) {
+      console.log('Failed to save 4-meter walk session:', error);
+    }
+  };
+
+  const loadDualTaskWalkSessions = async () => {
+    try {
+      const raw = await AsyncStorage.getItem('dual_task_walk_sessions_v1');
+      const parsed = raw ? JSON.parse(raw) : [];
+      setDualTaskWalkSessions(Array.isArray(parsed) ? parsed : []);
+    } catch (error) {
+      console.log('Failed to load dual-task walk sessions:', error);
+    }
+  };
+
+  const saveDualTaskWalkSession = async (session: DualTaskWalkSession) => {
+    const updated = [...dualTaskWalkSessions, session];
+    setDualTaskWalkSessions(updated);
+    try {
+      await AsyncStorage.setItem('dual_task_walk_sessions_v1', JSON.stringify(updated));
+    } catch (error) {
+      console.log('Failed to save dual-task walk session:', error);
     }
   };
 
@@ -7142,6 +7429,9 @@ export default function HomeScreen() {
     loadWhatsNewStatus();
     loadCheckIns();
     loadUserGoal();
+    loadFingerTappingSessions();
+    loadFourMeterWalkSessions();
+    loadDualTaskWalkSessions();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [requestPermission]);
 
@@ -7173,6 +7463,54 @@ export default function HomeScreen() {
 
     return () => clearInterval(interval);
   }, [resetRunning]);
+
+  // Finger Tapping countdown. Ticks tappingSecondsLeft down to 0 while
+  // tappingRunning; the effect below (reacting to that reaching 0)
+  // finalizes the hand's result separately, since this interval's own
+  // closure would otherwise finalize using a stale, start-of-test
+  // snapshot of tappingTaps instead of the real final tap count.
+  useEffect(() => {
+    if (!tappingRunning) return;
+    const interval = setInterval(() => {
+      setTappingSecondsLeft((seconds) => Math.max(0, seconds - 1));
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [tappingRunning]);
+
+  // Finalizes the current hand's result the render after the countdown
+  // reaches 0. A normal effect (not nested inside the interval above) so
+  // it always reads the fresh tappingTaps for this render, never a
+  // snapshot frozen at test-start.
+  useEffect(() => {
+    if (!tappingRunning || tappingSecondsLeft > 0) return;
+    const hand: FingerTappingHand = tappingHandIndex === 0 ? 'right' : 'left';
+    const result = computeFingerTappingHandResult(hand, tappingTaps, FINGER_TAPPING_DURATION_SECONDS);
+    setTappingHandResults((prev) => [...prev, result]);
+    setTappingRunning(false);
+    setTappingPhase('hand_done');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tappingRunning, tappingSecondsLeft]);
+
+  // Live elapsed-time display for the 4-Meter Walk's Start/Stop timer.
+  // Ticks walkTick once a second purely to force a re-render; the actual
+  // elapsed time shown and saved always comes from Date.now() minus
+  // walkStartMs, computed fresh at render/press time, never from this
+  // counter -- so there is no drift between what's displayed and what's
+  // saved.
+  useEffect(() => {
+    if (!walkRunning) return;
+    const interval = setInterval(() => setWalkTick((t) => t + 1), 1000);
+    return () => clearInterval(interval);
+  }, [walkRunning]);
+
+  // Same live-display pattern as the 4-Meter Walk timer above, for
+  // whichever of the Dual-Task Walk's two timed walks is currently
+  // running.
+  useEffect(() => {
+    if (!dualTaskRunning) return;
+    const interval = setInterval(() => setDualTaskTick((t) => t + 1), 1000);
+    return () => clearInterval(interval);
+  }, [dualTaskRunning]);
 
   // ----- On-device pose snapshot loop (Step 1) -----------------------------
   // While the user is recording, grab a still frame from the camera once a
@@ -10163,6 +10501,641 @@ export default function HomeScreen() {
       </ScrollView>
     );
   }
+
+  if (showFingerTapping) {
+    const handLabel = tappingHandIndex === 0 ? 'Right Hand' : 'Left Hand';
+    const liveHandResult = tappingHandResults[tappingHandIndex];
+    const rightResult = tappingHandResults[0];
+    const leftResult = tappingHandResults[1];
+    const asymmetryPercent =
+      rightResult && leftResult
+        ? computeTappingAsymmetryPercent(rightResult.tapRateHz, leftResult.tapRateHz)
+        : null;
+
+    const resetTappingTest = () => {
+      setTappingPhase('intro');
+      setTappingHandIndex(0);
+      setTappingTaps([]);
+      setTappingSecondsLeft(FINGER_TAPPING_DURATION_SECONDS);
+      setTappingRunning(false);
+      setTappingStartMs(null);
+      setTappingHandResults([]);
+    };
+
+    const exitTappingTest = () => {
+      resetTappingTest();
+      setShowFingerTapping(false);
+    };
+
+    const finishTappingSession = () => {
+      const session: FingerTappingSession = {
+        id: `tapping_${Date.now()}`,
+        timestamp: new Date().toISOString(),
+        hands: tappingHandResults,
+        asymmetryPercent,
+      };
+      saveFingerTappingSession(session);
+      setTappingPhase('session_done');
+    };
+
+    return (
+      <ScrollView
+        style={styles.homeScroll}
+        contentContainerStyle={styles.cameraSetupContent}
+        showsVerticalScrollIndicator={false}
+      >
+        <ScreenHeader onBack={exitTappingTest} />
+        <View style={styles.heroBadge}>
+          <Text style={styles.heroBadgeText}>Finger Tapping</Text>
+        </View>
+
+        {tappingPhase === 'intro' ? (
+          <>
+            <Text style={styles.title}>{handLabel}</Text>
+            <Text style={styles.subtitle}>
+              Tap the circle below with one finger as fast as you can for {FINGER_TAPPING_DURATION_SECONDS} seconds. Rest your hand naturally -- don&apos;t brace it against anything.
+            </Text>
+            <View style={styles.testResultCard}>
+              <Text style={styles.testResultLabel}>What this checks</Text>
+              <Text style={[styles.homeTileText, { marginTop: 6 }]}>
+                Tap speed, rhythm, and whether you slow down over the {FINGER_TAPPING_DURATION_SECONDS} seconds -- modeled on the timed finger-tapping test used in motor-speed research (the CAPSIT-PD protocol). Descriptive only, not a diagnosis.
+              </Text>
+            </View>
+            <Pressable
+              style={styles.mainButton}
+              onPress={() => {
+                setTappingTaps([]);
+                setTappingStartMs(Date.now());
+                setTappingSecondsLeft(FINGER_TAPPING_DURATION_SECONDS);
+                setTappingRunning(true);
+                setTappingPhase('running');
+              }}
+              accessibilityRole="button"
+              accessibilityLabel={`Start ${FINGER_TAPPING_DURATION_SECONDS}-second tap test for ${handLabel}`}
+            >
+              <Text style={styles.buttonText}>Start {FINGER_TAPPING_DURATION_SECONDS}-Second Test</Text>
+            </Pressable>
+          </>
+        ) : null}
+
+        {tappingPhase === 'running' ? (
+          <>
+            <Text style={styles.title}>{handLabel}</Text>
+            <Text style={styles.resetCountdownNumber}>{tappingSecondsLeft}</Text>
+            <Text style={[styles.dailyTaskDescription, { marginBottom: 24 }]}>
+              seconds left -- {tappingTaps.length} taps so far
+            </Text>
+            <Pressable
+              style={styles.tapTarget}
+              onPress={() => {
+                if (tappingStartMs === null) return;
+                setTappingTaps((prev) => [...prev, Date.now() - tappingStartMs]);
+              }}
+              accessibilityRole="button"
+              accessibilityLabel="Tap target"
+            >
+              <Text style={styles.tapTargetText}>TAP</Text>
+            </Pressable>
+          </>
+        ) : null}
+
+        {tappingPhase === 'hand_done' && liveHandResult ? (
+          <>
+            <Text style={styles.title}>{handLabel} Done</Text>
+            <View style={styles.testResultCard}>
+              <View style={styles.testResultRow}>
+                <Text style={styles.testResultLabel}>Taps</Text>
+                <Text style={styles.testResultValue}>{liveHandResult.tapCount}</Text>
+              </View>
+              <View style={styles.testResultRow}>
+                <Text style={styles.testResultLabel}>Tap Speed</Text>
+                <Text style={styles.testResultValue}>{liveHandResult.tapRateHz.toFixed(1)} taps/sec</Text>
+              </View>
+              <View style={styles.testResultRow}>
+                <Text style={styles.testResultLabel}>Rhythm Variability</Text>
+                <Text style={styles.testResultValue}>{liveHandResult.rhythmCV.toFixed(0)}% CV</Text>
+              </View>
+              <View style={[styles.testResultRow, { borderBottomWidth: 0 }]}>
+                <Text style={styles.testResultLabel}>2nd-Half Slowdown</Text>
+                <Text style={styles.testResultValue}>
+                  {liveHandResult.decrementPercent > 0
+                    ? `${liveHandResult.decrementPercent.toFixed(0)}% slower`
+                    : `${Math.abs(liveHandResult.decrementPercent).toFixed(0)}% faster`}
+                </Text>
+              </View>
+            </View>
+
+            {tappingHandIndex === 0 ? (
+              <>
+                <Pressable
+                  style={styles.mainButton}
+                  onPress={() => {
+                    setTappingHandIndex(1);
+                    setTappingPhase('intro');
+                  }}
+                  accessibilityRole="button"
+                  accessibilityLabel="Test left hand too"
+                >
+                  <Text style={styles.buttonText}>Test Left Hand Too</Text>
+                </Pressable>
+                <Pressable
+                  style={[styles.secondaryButton, { marginTop: 10 }]}
+                  onPress={finishTappingSession}
+                  accessibilityRole="button"
+                  accessibilityLabel="Finish with right hand only"
+                >
+                  <Text style={styles.secondaryButtonText}>Finish (Right Hand Only)</Text>
+                </Pressable>
+              </>
+            ) : (
+              <Pressable
+                style={styles.mainButton}
+                onPress={finishTappingSession}
+                accessibilityRole="button"
+                accessibilityLabel="See full results"
+              >
+                <Text style={styles.buttonText}>See Full Results</Text>
+              </Pressable>
+            )}
+          </>
+        ) : null}
+
+        {tappingPhase === 'session_done' ? (
+          <>
+            <Text style={styles.title}>Results Saved</Text>
+            <Text style={styles.subtitle}>
+              {leftResult
+                ? 'Right and left hand, compared below.'
+                : 'Right hand only -- test your left hand next time for a left/right comparison.'}
+            </Text>
+
+            {tappingHandResults.map((r) => (
+              <View key={r.hand} style={styles.testResultCard}>
+                <Text style={[styles.testResultLabel, { marginBottom: 8, textTransform: 'capitalize' }]}>
+                  {r.hand} Hand
+                </Text>
+                <View style={styles.testResultRow}>
+                  <Text style={styles.testResultLabel}>Taps</Text>
+                  <Text style={styles.testResultValue}>{r.tapCount}</Text>
+                </View>
+                <View style={styles.testResultRow}>
+                  <Text style={styles.testResultLabel}>Tap Speed</Text>
+                  <Text style={styles.testResultValue}>{r.tapRateHz.toFixed(1)} taps/sec</Text>
+                </View>
+                <View style={[styles.testResultRow, { borderBottomWidth: 0 }]}>
+                  <Text style={styles.testResultLabel}>Rhythm Variability</Text>
+                  <Text style={styles.testResultValue}>{r.rhythmCV.toFixed(0)}% CV</Text>
+                </View>
+              </View>
+            ))}
+
+            {asymmetryPercent !== null ? (
+              <View style={styles.testResultCard}>
+                <View style={[styles.testResultRow, { borderBottomWidth: 0 }]}>
+                  <Text style={styles.testResultLabel}>Left/Right Asymmetry</Text>
+                  <Text style={styles.testResultValue}>{asymmetryPercent.toFixed(0)}%</Text>
+                </View>
+                <Text style={[styles.homeTileText, { marginTop: 6 }]}>
+                  0% means both hands tapped equally fast. Higher means a bigger gap between them.
+                </Text>
+              </View>
+            ) : null}
+
+            <Pressable
+              style={[styles.secondaryButton, { marginBottom: 10 }]}
+              onPress={resetTappingTest}
+              accessibilityRole="button"
+              accessibilityLabel="Test again"
+            >
+              <Text style={styles.secondaryButtonText}>Test Again</Text>
+            </Pressable>
+            <Pressable
+              style={styles.mainButton}
+              onPress={exitTappingTest}
+              accessibilityRole="button"
+              accessibilityLabel="Back home"
+            >
+              <Text style={styles.buttonText}>Back Home</Text>
+            </Pressable>
+          </>
+        ) : null}
+      </ScrollView>
+    );
+  }
+
+  if (showFourMeterWalk) {
+    const resultBand = walkLastResult ? getGaitSpeedBand(walkLastResult.speedMps) : null;
+    const resultColors = resultBand ? getGaitSpeedBandColors(resultBand) : null;
+
+    const resetWalkTest = () => {
+      setWalkRunning(false);
+      setWalkStartMs(null);
+      setWalkTick(0);
+      setWalkLastResult(null);
+      setWalkComparisonPercent(null);
+    };
+
+    const exitWalkTest = () => {
+      resetWalkTest();
+      setShowFourMeterWalk(false);
+    };
+
+    return (
+      <ScrollView
+        style={styles.homeScroll}
+        contentContainerStyle={styles.cameraSetupContent}
+        showsVerticalScrollIndicator={false}
+      >
+        <ScreenHeader onBack={exitWalkTest} />
+        <View style={styles.heroBadge}>
+          <Text style={styles.heroBadgeText}>4-Meter Walk</Text>
+        </View>
+
+        {!walkRunning && !walkLastResult ? (
+          <>
+            <Text style={styles.title}>Gait Speed Check</Text>
+            <Text style={styles.subtitle}>
+              Measure out 4 meters in a straight line -- a hallway works well -- and mark the start and finish. Stand at the start.
+            </Text>
+            <View style={styles.testResultCard}>
+              <Text style={styles.testResultLabel}>How to time it</Text>
+              <Text style={[styles.homeTileText, { marginTop: 6 }]}>
+                Tap Start the instant you take your first step, walk at your normal, comfortable pace, then tap Stop the instant your foot crosses the finish line. This is the standard clinical 4-Meter Walk Test -- the same math a stopwatch and a tape measure would give you.
+              </Text>
+            </View>
+            <Pressable
+              style={styles.recordButton}
+              onPress={() => {
+                setWalkTick(0);
+                setWalkStartMs(Date.now());
+                setWalkRunning(true);
+              }}
+              accessibilityRole="button"
+              accessibilityLabel="Start walk timer"
+            >
+              <Text style={styles.buttonText}>Start</Text>
+            </Pressable>
+          </>
+        ) : null}
+
+        {walkRunning ? (
+          <>
+            <Text style={styles.title}>Walking...</Text>
+            <Text style={styles.subtitle}>Tap Stop the instant your foot crosses the 4-meter mark.</Text>
+            <Text style={styles.resetCountdownNumber}>{walkTick}s</Text>
+            <Pressable
+              style={[styles.stopButton, { marginTop: 24 }]}
+              onPress={() => {
+                const elapsedSeconds = (Date.now() - (walkStartMs ?? Date.now())) / 1000;
+                const speedMps = computeGaitSpeedMps(elapsedSeconds);
+                const previous =
+                  fourMeterWalkSessions.length > 0 ? fourMeterWalkSessions[fourMeterWalkSessions.length - 1] : null;
+                const session: FourMeterWalkSession = {
+                  id: `walk4m_${Date.now()}`,
+                  timestamp: new Date().toISOString(),
+                  elapsedSeconds,
+                  speedMps,
+                };
+                saveFourMeterWalkSession(session);
+                setWalkLastResult(session);
+                setWalkComparisonPercent(
+                  previous ? ((speedMps - previous.speedMps) / previous.speedMps) * 100 : null
+                );
+                setWalkRunning(false);
+              }}
+              accessibilityRole="button"
+              accessibilityLabel="Stop walk timer"
+            >
+              <Text style={styles.buttonText}>Stop</Text>
+            </Pressable>
+          </>
+        ) : null}
+
+        {!walkRunning && walkLastResult && resultBand && resultColors ? (
+          <>
+            <Text style={styles.title}>Walk Complete</Text>
+            <View style={styles.testResultCard}>
+              <View style={styles.testResultRow}>
+                <Text style={styles.testResultLabel}>Time</Text>
+                <Text style={styles.testResultValue}>{walkLastResult.elapsedSeconds.toFixed(1)}s</Text>
+              </View>
+              <View style={[styles.testResultRow, { borderBottomWidth: 0 }]}>
+                <Text style={styles.testResultLabel}>Gait Speed</Text>
+                <Text style={styles.testResultValue}>{walkLastResult.speedMps.toFixed(2)} m/s</Text>
+              </View>
+            </View>
+
+            <View
+              style={[styles.testResultBadge, { backgroundColor: resultColors.bg, borderColor: resultColors.border }]}
+            >
+              <Text style={[styles.testResultBadgeText, { color: resultColors.text }]}>
+                {getGaitSpeedBandLabel(resultBand)}
+              </Text>
+            </View>
+            <Text style={[styles.homeTileText, { textAlign: 'center', marginBottom: 16 }]}>
+              {resultBand === 'typical'
+                ? 'Within the range most studies report as typical for healthy adults.'
+                : resultBand === 'borderline'
+                ? 'Some studies link speeds in this range to a mild increase in fall risk -- a research association, not a diagnosis.'
+                : 'Several studies use 0.8 m/s as a cut-point linked to higher fall risk and other health outcomes -- a research association, not a diagnosis. Worth mentioning to a clinician if it surprises you.'}
+            </Text>
+
+            {walkComparisonPercent !== null ? (
+              <Text style={[styles.homeTileText, { textAlign: 'center', marginBottom: 16 }]}>
+                {walkComparisonPercent >= 0
+                  ? `${walkComparisonPercent.toFixed(0)}% faster than your last walk.`
+                  : `${Math.abs(walkComparisonPercent).toFixed(0)}% slower than your last walk.`}
+              </Text>
+            ) : null}
+
+            <Pressable
+              style={[styles.secondaryButton, { marginBottom: 10 }]}
+              onPress={resetWalkTest}
+              accessibilityRole="button"
+              accessibilityLabel="Walk again"
+            >
+              <Text style={styles.secondaryButtonText}>Walk Again</Text>
+            </Pressable>
+            <Pressable
+              style={styles.mainButton}
+              onPress={exitWalkTest}
+              accessibilityRole="button"
+              accessibilityLabel="Back home"
+            >
+              <Text style={styles.buttonText}>Back Home</Text>
+            </Pressable>
+          </>
+        ) : null}
+      </ScrollView>
+    );
+  }
+
+  if (showDualTaskWalk) {
+    const resetDualTaskTest = () => {
+      setDualTaskPhase('pick_task');
+      setDualTaskRunning(false);
+      setDualTaskStartMs(null);
+      setDualTaskTick(0);
+      setDualTaskPlainResult(null);
+      setDualTaskFinalResult(null);
+    };
+
+    const exitDualTaskTest = () => {
+      resetDualTaskTest();
+      setShowDualTaskWalk(false);
+    };
+
+    const finalBand = dualTaskFinalResult ? getGaitSpeedBand(dualTaskFinalResult.dualSpeedMps) : null;
+    const finalColors = finalBand ? getGaitSpeedBandColors(finalBand) : null;
+
+    return (
+      <ScrollView
+        style={styles.homeScroll}
+        contentContainerStyle={styles.cameraSetupContent}
+        showsVerticalScrollIndicator={false}
+      >
+        <ScreenHeader onBack={exitDualTaskTest} />
+        <View style={styles.heroBadge}>
+          <Text style={styles.heroBadgeText}>Dual-Task Walk</Text>
+        </View>
+
+        {dualTaskPhase === 'pick_task' ? (
+          <>
+            <Text style={styles.title}>Dual-Task Walk</Text>
+            <Text style={styles.subtitle}>
+              Walk the same 4 meters twice: once plain, once while doing a thinking task out loud. The gap between the two shows how much your walking slows down when your brain is busy too.
+            </Text>
+            <Text style={[styles.testResultLabel, { marginBottom: 10, alignSelf: 'flex-start' }]}>
+              Choose the thinking task
+            </Text>
+            <Pressable
+              style={[
+                styles.dailyTaskChip,
+                { marginBottom: 10, width: '100%' },
+                dualTaskCognitive === 'counting_backward' ? styles.dailyTaskChipActive : null,
+              ]}
+              onPress={() => setDualTaskCognitive('counting_backward')}
+              accessibilityRole="radio"
+              accessibilityState={{ selected: dualTaskCognitive === 'counting_backward' }}
+            >
+              <Text style={styles.dailyTaskChipText}>Counting Backward by 3s</Text>
+            </Pressable>
+            <Pressable
+              style={[
+                styles.dailyTaskChip,
+                { marginBottom: 20, width: '100%' },
+                dualTaskCognitive === 'naming_animals' ? styles.dailyTaskChipActive : null,
+              ]}
+              onPress={() => setDualTaskCognitive('naming_animals')}
+              accessibilityRole="radio"
+              accessibilityState={{ selected: dualTaskCognitive === 'naming_animals' }}
+            >
+              <Text style={styles.dailyTaskChipText}>Naming Animals</Text>
+            </Pressable>
+            <Pressable
+              style={styles.mainButton}
+              onPress={() => {
+                setDualTaskStartNumber(Math.floor(Math.random() * 60) + 40);
+                setDualTaskPhase('plain_ready');
+              }}
+              accessibilityRole="button"
+              accessibilityLabel="Begin dual-task walk"
+            >
+              <Text style={styles.buttonText}>Begin</Text>
+            </Pressable>
+          </>
+        ) : null}
+
+        {dualTaskPhase === 'plain_ready' ? (
+          <>
+            <Text style={styles.title}>Walk 1 of 2: Plain Walk</Text>
+            <Text style={styles.subtitle}>
+              Walk your measured 4 meters at your normal pace, same as the 4-Meter Walk test -- no counting yet. Tap Start the instant you step off, Stop the instant you cross the finish line.
+            </Text>
+            <Pressable
+              style={styles.recordButton}
+              onPress={() => {
+                setDualTaskTick(0);
+                setDualTaskStartMs(Date.now());
+                setDualTaskRunning(true);
+                setDualTaskPhase('plain_running');
+              }}
+              accessibilityRole="button"
+              accessibilityLabel="Start plain walk timer"
+            >
+              <Text style={styles.buttonText}>Start</Text>
+            </Pressable>
+          </>
+        ) : null}
+
+        {dualTaskPhase === 'plain_running' ? (
+          <>
+            <Text style={styles.title}>Walking...</Text>
+            <Text style={styles.subtitle}>Plain walk -- no counting. Tap Stop at the finish line.</Text>
+            <Text style={styles.resetCountdownNumber}>{dualTaskTick}s</Text>
+            <Pressable
+              style={[styles.stopButton, { marginTop: 24 }]}
+              onPress={() => {
+                const elapsedSeconds = (Date.now() - (dualTaskStartMs ?? Date.now())) / 1000;
+                const speedMps = computeGaitSpeedMps(elapsedSeconds);
+                setDualTaskPlainResult({ elapsedSeconds, speedMps });
+                setDualTaskRunning(false);
+                setDualTaskPhase('plain_done');
+              }}
+              accessibilityRole="button"
+              accessibilityLabel="Stop plain walk timer"
+            >
+              <Text style={styles.buttonText}>Stop</Text>
+            </Pressable>
+          </>
+        ) : null}
+
+        {dualTaskPhase === 'plain_done' && dualTaskPlainResult ? (
+          <>
+            <Text style={styles.title}>Walk 1 Done</Text>
+            <View style={styles.testResultCard}>
+              <View style={styles.testResultRow}>
+                <Text style={styles.testResultLabel}>Time</Text>
+                <Text style={styles.testResultValue}>{dualTaskPlainResult.elapsedSeconds.toFixed(1)}s</Text>
+              </View>
+              <View style={[styles.testResultRow, { borderBottomWidth: 0 }]}>
+                <Text style={styles.testResultLabel}>Gait Speed</Text>
+                <Text style={styles.testResultValue}>{dualTaskPlainResult.speedMps.toFixed(2)} m/s</Text>
+              </View>
+            </View>
+            <Text style={[styles.subtitle, { marginTop: 4 }]}>
+              Now walk it again, the same way, but this time with the thinking task.
+            </Text>
+            <Pressable
+              style={styles.mainButton}
+              onPress={() => setDualTaskPhase('dual_ready')}
+              accessibilityRole="button"
+              accessibilityLabel="Continue to the dual-task walk"
+            >
+              <Text style={styles.buttonText}>Continue</Text>
+            </Pressable>
+          </>
+        ) : null}
+
+        {dualTaskPhase === 'dual_ready' ? (
+          <>
+            <Text style={styles.title}>Walk 2 of 2: While Counting</Text>
+            <View style={styles.testResultCard}>
+              <Text style={styles.testResultLabel}>{getDualTaskCognitiveTaskLabel(dualTaskCognitive)}</Text>
+              <Text style={[styles.homeTileText, { marginTop: 6 }]}>
+                {getDualTaskCognitiveTaskInstruction(dualTaskCognitive, dualTaskStartNumber)}
+              </Text>
+            </View>
+            <Text style={styles.subtitle}>
+              Try to do both the walk and the counting as well as you can -- don&apos;t favor one over the other. Tap Start the instant you step off, Stop at the finish line.
+            </Text>
+            <Pressable
+              style={styles.recordButton}
+              onPress={() => {
+                setDualTaskTick(0);
+                setDualTaskStartMs(Date.now());
+                setDualTaskRunning(true);
+                setDualTaskPhase('dual_running');
+              }}
+              accessibilityRole="button"
+              accessibilityLabel="Start dual-task walk timer"
+            >
+              <Text style={styles.buttonText}>Start</Text>
+            </Pressable>
+          </>
+        ) : null}
+
+        {dualTaskPhase === 'dual_running' ? (
+          <>
+            <Text style={styles.title}>Walking + {getDualTaskCognitiveTaskLabel(dualTaskCognitive)}</Text>
+            <Text style={styles.subtitle}>
+              {getDualTaskCognitiveTaskInstruction(dualTaskCognitive, dualTaskStartNumber)}
+            </Text>
+            <Text style={styles.resetCountdownNumber}>{dualTaskTick}s</Text>
+            <Pressable
+              style={[styles.stopButton, { marginTop: 24 }]}
+              onPress={() => {
+                if (!dualTaskPlainResult) return;
+                const elapsedSeconds = (Date.now() - (dualTaskStartMs ?? Date.now())) / 1000;
+                const speedMps = computeGaitSpeedMps(elapsedSeconds);
+                const dualTaskCostPercent = computeDualTaskCostPercent(dualTaskPlainResult.speedMps, speedMps);
+                const session: DualTaskWalkSession = {
+                  id: `dualtask_${Date.now()}`,
+                  timestamp: new Date().toISOString(),
+                  cognitiveTask: dualTaskCognitive,
+                  plainElapsedSeconds: dualTaskPlainResult.elapsedSeconds,
+                  plainSpeedMps: dualTaskPlainResult.speedMps,
+                  dualElapsedSeconds: elapsedSeconds,
+                  dualSpeedMps: speedMps,
+                  dualTaskCostPercent,
+                };
+                saveDualTaskWalkSession(session);
+                setDualTaskFinalResult(session);
+                setDualTaskRunning(false);
+                setDualTaskPhase('dual_done');
+              }}
+              accessibilityRole="button"
+              accessibilityLabel="Stop dual-task walk timer"
+            >
+              <Text style={styles.buttonText}>Stop</Text>
+            </Pressable>
+          </>
+        ) : null}
+
+        {dualTaskPhase === 'dual_done' && dualTaskFinalResult && finalBand && finalColors ? (
+          <>
+            <Text style={styles.title}>Results</Text>
+            <View style={styles.testResultCard}>
+              <View style={styles.testResultRow}>
+                <Text style={styles.testResultLabel}>Plain Walk</Text>
+                <Text style={styles.testResultValue}>{dualTaskFinalResult.plainSpeedMps.toFixed(2)} m/s</Text>
+              </View>
+              <View style={styles.testResultRow}>
+                <Text style={styles.testResultLabel}>While Counting</Text>
+                <Text style={styles.testResultValue}>{dualTaskFinalResult.dualSpeedMps.toFixed(2)} m/s</Text>
+              </View>
+              <View style={[styles.testResultRow, { borderBottomWidth: 0 }]}>
+                <Text style={styles.testResultLabel}>Dual-Task Cost</Text>
+                <Text style={styles.testResultValue}>{dualTaskFinalResult.dualTaskCostPercent.toFixed(0)}%</Text>
+              </View>
+            </View>
+
+            <View
+              style={[styles.testResultBadge, { backgroundColor: finalColors.bg, borderColor: finalColors.border }]}
+            >
+              <Text style={[styles.testResultBadgeText, { color: finalColors.text }]}>
+                {getGaitSpeedBandLabel(finalBand)} while dual-tasking
+              </Text>
+            </View>
+
+            <Text style={[styles.homeTileText, { textAlign: 'center', marginBottom: 16 }]}>
+              {dualTaskFinalResult.dualTaskCostPercent > 0
+                ? `Your walk slowed by ${dualTaskFinalResult.dualTaskCostPercent.toFixed(0)}% while counting. Research links a bigger gap here to higher fall and cognitive-decline risk -- this is a research association, not a diagnosis.`
+                : 'Your walk was no slower while counting -- a smaller gap (or none) is generally the more reassuring result in the research this is based on.'}
+            </Text>
+
+            <Pressable
+              style={[styles.secondaryButton, { marginBottom: 10 }]}
+              onPress={resetDualTaskTest}
+              accessibilityRole="button"
+              accessibilityLabel="Test again"
+            >
+              <Text style={styles.secondaryButtonText}>Test Again</Text>
+            </Pressable>
+            <Pressable
+              style={styles.mainButton}
+              onPress={exitDualTaskTest}
+              accessibilityRole="button"
+              accessibilityLabel="Back home"
+            >
+              <Text style={styles.buttonText}>Back Home</Text>
+            </Pressable>
+          </>
+        ) : null}
+      </ScrollView>
+    );
+  }
+
 
   if (showDailyCheckIn) {
     const todayCheckIn = getTodayCheckIn(checkIns);
@@ -13554,7 +14527,10 @@ export default function HomeScreen() {
             <Text style={styles.buttonText}>Start</Text>
           </Pressable>
 
-          <Text style={[styles.sectionTitle, { marginTop: 28 }]}>Explore</Text>
+          <Text style={[styles.sectionTitle, { marginTop: 28 }]}>Quick Tests</Text>
+          <Text style={[styles.homeTileText, { marginBottom: 12 }]}>
+            Short, structured checks you can repeat over time -- no camera needed.
+          </Text>
           <View style={styles.homeTileGrid}>
             <Pressable
               style={styles.homeTile}
@@ -13570,6 +14546,51 @@ export default function HomeScreen() {
               <Text style={styles.homeTileText}>A couple minutes back for you -- no score, no video.</Text>
             </Pressable>
 
+            <Pressable
+              style={styles.homeTile}
+              onPress={() => {
+                closeAllOverlays();
+                setShowFingerTapping(true);
+              }}
+              accessibilityRole="button"
+              accessibilityLabel="Finger Tapping"
+              accessibilityHint="Opens a timed finger-tapping test for motor speed and rhythm."
+            >
+              <Text style={styles.homeTileTitle}>Finger Tapping</Text>
+              <Text style={styles.homeTileText}>Tap speed, rhythm, and fatigue over 10 seconds per hand.</Text>
+            </Pressable>
+
+            <Pressable
+              style={styles.homeTile}
+              onPress={() => {
+                closeAllOverlays();
+                setShowFourMeterWalk(true);
+              }}
+              accessibilityRole="button"
+              accessibilityLabel="4-Meter Walk"
+              accessibilityHint="Opens a timed 4-meter walk to measure gait speed."
+            >
+              <Text style={styles.homeTileTitle}>4-Meter Walk</Text>
+              <Text style={styles.homeTileText}>Gait speed from a timed 4-meter walk -- a clinical vital sign.</Text>
+            </Pressable>
+
+            <Pressable
+              style={styles.homeTile}
+              onPress={() => {
+                closeAllOverlays();
+                setShowDualTaskWalk(true);
+              }}
+              accessibilityRole="button"
+              accessibilityLabel="Dual-Task Walk"
+              accessibilityHint="Opens a walk-while-thinking test comparing plain and dual-task gait speed."
+            >
+              <Text style={styles.homeTileTitle}>Dual-Task Walk</Text>
+              <Text style={styles.homeTileText}>Walk once plain, once while counting -- see the gap.</Text>
+            </Pressable>
+          </View>
+
+          <Text style={[styles.sectionTitle, { marginTop: 20 }]}>Explore</Text>
+          <View style={styles.homeTileGrid}>
             <Pressable
               style={styles.homeTile}
               onPress={() => {
@@ -19558,6 +20579,74 @@ const styles = StyleSheet.create({
     color: '#94a3b8',
     fontSize: 12,
     lineHeight: 16,
+  },
+
+  tapTarget: {
+    width: 200,
+    height: 200,
+    borderRadius: 100,
+    backgroundColor: '#2563eb',
+    alignItems: 'center',
+    justifyContent: 'center',
+    alignSelf: 'center',
+    shadowColor: '#2563eb',
+    shadowOpacity: 0.3,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 10 },
+    elevation: 8,
+    marginBottom: 20,
+  },
+
+  tapTargetText: {
+    color: '#ffffff',
+    fontSize: 22,
+    fontWeight: '800',
+    letterSpacing: 1,
+  },
+
+  testResultCard: {
+    width: '100%',
+    backgroundColor: 'rgba(30, 41, 59, 0.95)',
+    borderWidth: 1,
+    borderColor: 'rgba(96, 165, 250, 0.24)',
+    borderRadius: 18,
+    padding: 18,
+    marginBottom: 16,
+  },
+
+  testResultRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 6,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(148, 163, 184, 0.1)',
+  },
+
+  testResultLabel: {
+    color: '#94a3b8',
+    fontSize: 14,
+  },
+
+  testResultValue: {
+    color: '#ffffff',
+    fontSize: 15,
+    fontWeight: '700',
+  },
+
+  testResultBadge: {
+    alignSelf: 'center',
+    paddingVertical: 6,
+    paddingHorizontal: 14,
+    borderRadius: 999,
+    borderWidth: 1,
+    marginTop: 8,
+    marginBottom: 8,
+  },
+
+  testResultBadgeText: {
+    fontSize: 13,
+    fontWeight: '800',
   },
 
   unreadDot: {

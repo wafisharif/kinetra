@@ -299,4 +299,164 @@ test.describe('Kinetra regression suite', () => {
     const filtered = errors.filter((e) => !/jsqr/i.test(e));
     expect(filtered).toEqual([]);
   });
+
+  // ----- Quick Tests: Finger Tapping, 4-Meter Walk, Dual-Task Walk --------
+  // These three use page.clock (Playwright's fake-timer API) instead of
+  // real waits, so a 10-second tap test or a multi-second walk timer
+  // finishes instantly in the test run while still exercising the exact
+  // same Date.now()-driven code path the real app runs. Every assertion
+  // below is a value hand-computed from the published formulas (CAPSIT-PD
+  // tap rate/rhythm/asymmetry, the 4-Meter Walk Test's distance/time, and
+  // the CCNA Dual-Task Gait Cost formula), not just "some number appears" --
+  // this is the suite's real check that the math is exactly right.
+
+  test('Finger Tapping records taps, rhythm, decrement, and left/right asymmetry correctly', async ({ page }) => {
+    await page.clock.install();
+    await page.clock.pauseAt(new Date());
+    await clickText(page, 'Finger Tapping');
+    await page.waitForTimeout(300);
+
+    let text = await page.locator('body').innerText();
+    expect(text).toContain('Right Hand');
+    expect(text).toContain('CAPSIT-PD');
+
+    await clickText(page, 'Start 10-Second Test');
+    await page.waitForTimeout(100);
+
+    // 6 taps, exactly 1500ms apart (t = 0, 1500, 3000, 4500, 6000, 7500),
+    // then let the clock run out past the 10s window.
+    for (let i = 0; i < 6; i++) {
+      await clickText(page, 'TAP', { exact: true });
+      await page.clock.runFor(1500);
+    }
+    await page.clock.runFor(2000);
+    await page.waitForTimeout(200);
+
+    text = await page.locator('body').innerText();
+    expect(text).toContain('Right Hand Done');
+    // tapRateHz = 6 taps / 10s = 0.6
+    expect(text).toContain('0.6 taps/sec');
+    // All 5 intervals are exactly 1500ms apart -> zero rhythm variability.
+    expect(text).toContain('0% CV');
+    // First half (0-5s): taps at 0,1500,3000,4500 = 4 taps -> 0.8/s.
+    // Second half (5-10s): taps at 6000,7500 = 2 taps -> 0.4/s.
+    // decrement = (0.8-0.4)/0.8 * 100 = 50% slower.
+    expect(text).toContain('50% slower');
+
+    // Left hand, zero taps -- the edge case that must not divide by zero
+    // or render NaN anywhere (tap rate, rhythm CV, decrement, asymmetry).
+    await clickText(page, 'Test Left Hand Too');
+    await page.waitForTimeout(300);
+    text = await page.locator('body').innerText();
+    expect(text).toContain('Left Hand');
+
+    await clickText(page, 'Start 10-Second Test');
+    await page.clock.runFor(11000);
+    await page.waitForTimeout(200);
+
+    text = await page.locator('body').innerText();
+    expect(text).not.toContain('NaN');
+    expect(text).toContain('0.0 taps/sec');
+
+    await clickText(page, 'See Full Results');
+    await page.waitForTimeout(300);
+    text = await page.locator('body').innerText();
+    expect(text).toContain('Results Saved');
+    expect(text).toContain('Left/Right Asymmetry');
+    // better=0.6, worse=0 -> 100 * (0.6-0)/(0.6+0) = 100%.
+    expect(text).toContain('100%');
+    expect(text).not.toContain('NaN');
+
+    await clickText(page, 'Back Home');
+  });
+
+  test('4-Meter Walk computes gait speed, bands, and the vs-last-walk comparison correctly', async ({ page }) => {
+    await page.clock.install();
+    await page.clock.pauseAt(new Date());
+    await clickText(page, '4-Meter Walk');
+    await page.waitForTimeout(300);
+
+    let text = await page.locator('body').innerText();
+    expect(text).toContain('Gait Speed Check');
+
+    // Walk 1: 2 seconds for 4 meters -> 2.00 m/s (typical).
+    await clickText(page, 'Start', { exact: true });
+    await page.clock.runFor(2000);
+    await clickText(page, 'Stop', { exact: true });
+    await page.waitForTimeout(200);
+
+    text = await page.locator('body').innerText();
+    expect(text).toContain('2.0s');
+    expect(text).toContain('2.00 m/s');
+    expect(text).toContain('Typical range');
+
+    // Walk 2: 5 seconds for 4 meters -> 0.80 m/s, exactly on the
+    // borderline cut-point (>=0.8 is borderline, not slow).
+    await clickText(page, 'Walk Again');
+    await page.waitForTimeout(200);
+    await clickText(page, 'Start', { exact: true });
+    await page.clock.runFor(5000);
+    await clickText(page, 'Stop', { exact: true });
+    await page.waitForTimeout(200);
+
+    text = await page.locator('body').innerText();
+    expect(text).toContain('5.0s');
+    expect(text).toContain('0.80 m/s');
+    expect(text).toContain('Borderline');
+    // vs. the first walk: (0.80-2.00)/2.00 * 100 = -60% -> "60% slower".
+    expect(text).toContain('60% slower than your last walk');
+
+    await clickText(page, 'Back Home');
+  });
+
+  test('Dual-Task Walk computes plain/dual gait speed and Dual-Task Cost correctly', async ({ page }) => {
+    await page.clock.install();
+    await page.clock.pauseAt(new Date());
+    await clickText(page, 'Dual-Task Walk');
+    await page.waitForTimeout(300);
+
+    let text = await page.locator('body').innerText();
+    expect(text).toContain('Dual-Task Walk');
+
+    await clickText(page, 'Naming Animals');
+    await clickText(page, 'Begin');
+    await page.waitForTimeout(200);
+
+    text = await page.locator('body').innerText();
+    expect(text).toContain('Walk 1 of 2: Plain Walk');
+
+    // Plain walk: 4 seconds for 4 meters -> 1.00 m/s.
+    await clickText(page, 'Start', { exact: true });
+    await page.clock.runFor(4000);
+    await clickText(page, 'Stop', { exact: true });
+    await page.waitForTimeout(200);
+
+    text = await page.locator('body').innerText();
+    expect(text).toContain('4.0s');
+    expect(text).toContain('1.00 m/s');
+
+    await clickText(page, 'Continue');
+    await page.waitForTimeout(200);
+    text = await page.locator('body').innerText();
+    expect(text).toContain('Walk 2 of 2');
+    expect(text).toContain('Say a different animal');
+
+    // Dual-task walk: 8 seconds for 4 meters -> 0.50 m/s.
+    await clickText(page, 'Start', { exact: true });
+    await page.clock.runFor(8000);
+    await clickText(page, 'Stop', { exact: true });
+    await page.waitForTimeout(200);
+
+    text = await page.locator('body').innerText();
+    expect(text).toContain('1.00 m/s');
+    expect(text).toContain('0.50 m/s');
+    // DTGC = (1.00-0.50)/1.00 * 100 = 50%.
+    expect(text).toContain('50%');
+    // band for 0.50 m/s is "slow" (<0.8).
+    expect(text).toContain('Below 0.8 m/s while dual-tasking');
+    expect(text).toContain('Your walk slowed by 50% while counting');
+    expect(text).not.toContain('NaN');
+
+    await clickText(page, 'Back Home');
+  });
 });
