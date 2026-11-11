@@ -1,5 +1,5 @@
 import { reportError } from '@/constants/crashReporting';
-import { useOnDevicePose } from '@/hooks/useOnDevicePose';
+import { useOnDevicePose, type PoseDetectionSnapshot } from '@/hooks/useOnDevicePose';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as Notifications from 'expo-notifications';
@@ -423,6 +423,205 @@ const TWO_MINUTE_RESET_STEPS: TwoMinuteResetStep[] = [
     seconds: 30,
   },
 ];
+
+// ===== Hand Checks (Phase 1): camera-based hand/finger movement tasks ====
+// Five on-device-camera tasks analyzed by the backend's HandLandmarker
+// pipeline (hand_tasks.py / POST /analyze-hand), parallel to the body-pose
+// camera tasks above but scoped to one hand at a time. Deliberately kept
+// as its own self-contained flow (own camera ref, own recording state, own
+// AsyncStorage key -- see state/storage below) rather than folded into the
+// `mode`/`dailyTask` system above: that system's calibration, comparison-
+// session, and trend machinery is specific to the body-pose tasks it was
+// built for, and wiring a fundamentally different analysis (one hand,
+// HandLandmarker, raw-measurement-only output) through it would risk
+// breaking those existing paths for no real benefit. Same hard rule as
+// everywhere else in this app: raw measurements only, never a score or
+// severity grade -- see hand_tasks.py's own docstring for the backend
+// side of this rule.
+type HandTask =
+  | 'finger_tapping_camera'
+  | 'hand_open_close'
+  | 'pronation_supination'
+  | 'postural_tremor'
+  | 'rest_tremor';
+
+const HAND_TASKS: HandTask[] = [
+  'finger_tapping_camera',
+  'hand_open_close',
+  'pronation_supination',
+  'postural_tremor',
+  'rest_tremor',
+];
+
+type HandSide = 'right' | 'left';
+
+// Mirrors server.py/hand_tasks.py's result shape. `task_analysis` is
+// deliberately loose -- the backend already attaches metric_units/
+// metric_descriptions dicts keyed by whichever metric names apply to this
+// task, and the result screen below renders from those dicts generically
+// instead of hardcoding each task's field names twice (once in Python,
+// once here).
+type HandTaskAnalysis = {
+  task_type?: string;
+  status?: string;
+  metric_units?: Record<string, string>;
+  metric_descriptions?: Record<string, string>;
+  [metric: string]: unknown;
+};
+
+type HandAnalysisResult = {
+  algorithm_version?: string;
+  hand_task: HandTask;
+  hand: HandSide;
+  trial_index?: number | null;
+  total_frames?: number;
+  fps?: number;
+  recording_quality_warnings?: string[];
+  tracking_confidence_summary?: {
+    low_confidence_frames?: number;
+    total_frames_tracked?: number;
+  };
+  visible_frame_ratio?: number;
+  task_analysis?: HandTaskAnalysis;
+};
+
+// One saved attempt at a hand task, stored locally (own AsyncStorage key)
+// the same way the Quick Tests below save their own sessions -- kept
+// separate from the main movement-check History/Trend screens, which are
+// built around the body-pose `mode`/`dailyTask` result shape.
+type HandCheckSession = {
+  id: string;
+  savedAt: string;
+  hand_task: HandTask;
+  hand: HandSide;
+  result: HandAnalysisResult;
+};
+
+function getHandTaskLabel(task: HandTask): string {
+  if (task === 'finger_tapping_camera') return 'Finger Tapping (Camera)';
+  if (task === 'hand_open_close') return 'Hand Open/Close';
+  if (task === 'pronation_supination') return 'Pronation-Supination';
+  if (task === 'postural_tremor') return 'Postural Tremor';
+  return 'Rest Tremor';
+}
+
+function getHandTaskOneLiner(task: HandTask): string {
+  if (task === 'finger_tapping_camera') {
+    return 'Tap your thumb and index finger together, on camera, as steadily as you can.';
+  }
+  if (task === 'hand_open_close') {
+    return 'Open your hand fully, then close it into a fist, repeatedly, on camera.';
+  }
+  if (task === 'pronation_supination') {
+    return 'Turn your forearm palm-up, then palm-down, repeatedly, on camera.';
+  }
+  if (task === 'postural_tremor') {
+    return 'Hold your hand out flat and still in front of you while the camera watches for shake.';
+  }
+  return 'Rest your hand in your lap, fully relaxed, while the camera watches for shake.';
+}
+
+function getHandTaskInstructions(task: HandTask): string[] {
+  if (task === 'finger_tapping_camera') {
+    return [
+      'Hold your hand up so your thumb and index finger are both clearly visible.',
+      'Tap your thumb and index finger together, then open them fully apart, as quickly and steadily as you can.',
+      'Keep your hand roughly in the same spot -- the camera is watching finger movement, not hand position.',
+      'Record for about 10-15 seconds.',
+    ];
+  }
+  if (task === 'hand_open_close') {
+    return [
+      'Hold your hand up, palm facing the camera, fingers together.',
+      'Open your hand as wide as you can, then close it into a fist, repeatedly.',
+      'Keep your wrist and forearm still -- only the hand should be opening and closing.',
+      'Record for about 10-15 seconds.',
+    ];
+  }
+  if (task === 'pronation_supination') {
+    return [
+      'Hold your forearm up with your elbow roughly stationary.',
+      'Turn your palm to face up, then rotate it to face down, repeatedly, like turning a doorknob back and forth.',
+      'Keep your whole hand in frame through the full rotation.',
+      'Record for about 10-15 seconds.',
+    ];
+  }
+  if (task === 'postural_tremor') {
+    return [
+      'Hold your arm straight out in front of you, hand flat, fingers spread.',
+      "Hold as still as you comfortably can -- don't tap or move on purpose.",
+      'Keep your whole hand in frame for the full recording.',
+      'Record for about 10-15 seconds, longer if you can hold it comfortably.',
+    ];
+  }
+  return [
+    'Rest your hand in your lap or on a flat surface, fully relaxed.',
+    "Don't hold it up or tense it -- let it rest naturally.",
+    'Keep your whole hand in frame for the full recording.',
+    'Record for about 10-15 seconds, longer if you can hold it comfortably.',
+  ];
+}
+
+// Turns a raw numeric metric value into a short display string. Counts are
+// shown as whole numbers; percents get one decimal place; everything else
+// is rounded to at most 2 decimal places. A missing/non-numeric value (the
+// backend only fills in fields that applied to this task) renders as "--"
+// rather than "NaN" or "undefined".
+function formatHandMetricValue(value: unknown, unit: string | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '--';
+  if (unit === 'count') return String(Math.round(value));
+  if (unit === '%') return `${Math.round(value * 10) / 10}`;
+  return `${Math.round(value * 100) / 100}`;
+}
+
+type HandMetricRow = {
+  key: string;
+  label: string;
+  value: string;
+  unit: string;
+  description: string;
+};
+
+// Plain-English labels for every metric key hand_tasks.py can emit (see
+// _package_cyclic_metrics/_package_tremor_metrics and _wrist_stability).
+// Keeping this list exhaustive means a key missing from it is immediately
+// obvious in the UI (it falls back to the raw key name below) rather than
+// silently rendering a correct-but-ugly label forever.
+const HAND_METRIC_LABELS: Record<string, string> = {
+  tap_count: 'Taps',
+  tap_rate_hz: 'Tap Rate',
+  cycle_count: 'Cycles',
+  cycle_rate_hz: 'Cycle Rate',
+  mean_amplitude: 'Average Amplitude',
+  max_amplitude: 'Max Amplitude',
+  amplitude_decrement_percent: 'Amplitude Decrement',
+  mean_cycle_speed: 'Average Speed',
+  rhythm_cv: 'Rhythm Variability',
+  halt_count: 'Halts',
+  dominant_frequency_hz: 'Dominant Frequency',
+  power_in_tremor_band_fraction: 'Power in Tremor Band',
+  relative_amplitude: 'Relative Amplitude',
+  wrist_stability: 'Wrist Stability',
+};
+
+// Builds the ordered list of {label, value, unit, description} rows the
+// result screen renders, directly from the backend's own metric_units/
+// metric_descriptions dicts rather than hardcoding each task's field names
+// a second time here. This is also why a new metric added on the backend
+// shows up with its units and description automatically, with only its
+// display label needing a one-line addition above.
+function getHandMetricRows(analysis: HandTaskAnalysis | undefined): HandMetricRow[] {
+  if (!analysis || !analysis.metric_units) return [];
+  const units = analysis.metric_units;
+  const descriptions = analysis.metric_descriptions ?? {};
+  return Object.keys(units).map((key) => ({
+    key,
+    label: HAND_METRIC_LABELS[key] ?? key,
+    value: formatHandMetricValue(analysis[key], units[key]),
+    unit: units[key] === 'count' ? '' : units[key],
+    description: descriptions[key] ?? '',
+  }));
+}
 
 // ===== Quick Tests: Finger Tapping, 4-Meter Walk, Dual-Task Walk =========
 // Recommended by Dr. Rao (external clinical advisor) as lightweight,
@@ -1789,6 +1988,47 @@ function getRecordingQualityChecklist(task: DailyTask) {
     'Hips, knees, ankles, and feet are visible.',
     'Chair and floor area are clearly visible.',
     'Camera is stable and not held in your hand.',
+  ];
+}
+
+// Phase 0 item 3: turn the raw on-device detection snapshot (landmark
+// count, number of distinct people seen, and the tracked person's
+// normalized bounding box) into a simple three-item traffic-light
+// checklist the setup screen can render *before* the user hits Record.
+// `ok: null` means "can't tell yet" (e.g. nobody detected at all) and is
+// rendered as a neutral dot rather than a hard pass or fail.
+function getFramingChecklistItems(snapshot: PoseDetectionSnapshot | null) {
+  if (!snapshot || snapshot.poseCount === 0 || !snapshot.bbox) {
+    return [
+      { label: 'Only one person in frame', ok: null as boolean | null },
+      { label: 'Fully in frame', ok: null as boolean | null },
+      { label: 'Centered', ok: null as boolean | null },
+    ];
+  }
+
+  const { bbox, poseCount, count } = snapshot;
+  const EDGE_MARGIN = 0.04;
+  const CENTER_TOLERANCE = 0.18;
+
+  const onlyOnePerson = poseCount <= 1;
+
+  const touchesEdge =
+    bbox.minX < EDGE_MARGIN ||
+    bbox.minY < EDGE_MARGIN ||
+    bbox.maxX > 1 - EDGE_MARGIN ||
+    bbox.maxY > 1 - EDGE_MARGIN;
+  const fullyInFrame = !touchesEdge && count >= 28;
+
+  const centerX = (bbox.minX + bbox.maxX) / 2;
+  const centerY = (bbox.minY + bbox.maxY) / 2;
+  const centered =
+    Math.abs(centerX - 0.5) <= CENTER_TOLERANCE &&
+    Math.abs(centerY - 0.5) <= CENTER_TOLERANCE;
+
+  return [
+    { label: 'Only one person in frame', ok: onlyOnePerson },
+    { label: 'Fully in frame', ok: fullyInFrame },
+    { label: 'Centered', ok: centered },
   ];
 }
 
@@ -6531,6 +6771,11 @@ export default function HomeScreen() {
   const onDevicePose = useOnDevicePose();
   const OnDevicePoseWorker = onDevicePose.Worker;
   const [onDeviceJointCount, setOnDeviceJointCount] = useState<number | null>(null);
+  // Live framing snapshot (Phase 0 item 3): the most recent detection's
+  // headcount of distinct people in frame and the single tracked person's
+  // normalized bounding box, used to drive the "Centered / Fully in frame /
+  // Only one person" checklist below. null until the first successful tick.
+  const [onDeviceFraming, setOnDeviceFraming] = useState<PoseDetectionSnapshot | null>(null);
 
   // Simplified navigation (redesign): most of the screen-specific "show*"
   // flags above are full-screen overlays that used to each get their own
@@ -6569,6 +6814,7 @@ export default function HomeScreen() {
     setShowFingerTapping(false);
     setShowFourMeterWalk(false);
     setShowDualTaskWalk(false);
+    setShowHandChecks(false);
   };
 
   // Redesign: the home screen used to show every destination (including
@@ -6624,6 +6870,21 @@ export default function HomeScreen() {
   const [dualTaskTick, setDualTaskTick] = useState(0); // same once-per-second display counter as walkTick above
   const [dualTaskPlainResult, setDualTaskPlainResult] = useState<{ elapsedSeconds: number; speedMps: number } | null>(null);
   const [dualTaskFinalResult, setDualTaskFinalResult] = useState<DualTaskWalkSession | null>(null);
+
+  // ----- Hand Checks (Phase 1) --------------------------------------------
+  const [showHandChecks, setShowHandChecks] = useState(false);
+  const [activeHandTask, setActiveHandTask] = useState<HandTask>('finger_tapping_camera');
+  const [handSide, setHandSide] = useState<HandSide>('right');
+  const [handPhase, setHandPhase] = useState<'setup' | 'camera' | 'result'>('setup');
+  const [handCameraReady, setHandCameraReady] = useState(false);
+  const [handRecording, setHandRecording] = useState(false);
+  const [handIsAnalyzing, setHandIsAnalyzing] = useState(false);
+  const [handAnalysisStatusMessage, setHandAnalysisStatusMessage] = useState('');
+  const [handAnalysisError, setHandAnalysisError] = useState<string | null>(null);
+  const [handAnalysisResult, setHandAnalysisResult] = useState<HandAnalysisResult | null>(null);
+  const [handCheckSessions, setHandCheckSessions] = useState<HandCheckSession[]>([]);
+  const handCameraRef = useRef<any>(null);
+  const handUploadTokenRef = useRef(0);
 
 
   // Redesign, round 2: a one-time "why are you here" question for a brand
@@ -6748,6 +7009,26 @@ export default function HomeScreen() {
       await AsyncStorage.setItem('dual_task_walk_sessions_v1', JSON.stringify(updated));
     } catch (error) {
       console.log('Failed to save dual-task walk session:', error);
+    }
+  };
+
+  const loadHandCheckSessions = async () => {
+    try {
+      const raw = await AsyncStorage.getItem('hand_check_sessions_v1');
+      const parsed = raw ? JSON.parse(raw) : [];
+      setHandCheckSessions(Array.isArray(parsed) ? parsed : []);
+    } catch (error) {
+      console.log('Failed to load hand check sessions:', error);
+    }
+  };
+
+  const saveHandCheckSession = async (session: HandCheckSession) => {
+    const updated = [...handCheckSessions, session];
+    setHandCheckSessions(updated);
+    try {
+      await AsyncStorage.setItem('hand_check_sessions_v1', JSON.stringify(updated));
+    } catch (error) {
+      console.log('Failed to save hand check session:', error);
     }
   };
 
@@ -7432,6 +7713,7 @@ export default function HomeScreen() {
     loadFingerTappingSessions();
     loadFourMeterWalkSessions();
     loadDualTaskWalkSessions();
+    loadHandCheckSessions();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [requestPermission]);
 
@@ -7512,15 +7794,19 @@ export default function HomeScreen() {
     return () => clearInterval(interval);
   }, [dualTaskRunning]);
 
-  // ----- On-device pose snapshot loop (Step 1) -----------------------------
-  // While the user is recording, grab a still frame from the camera once a
-  // second and ask the on-device pose model how many joints it can see.
-  // We deliberately don't try to be faster than ~1 fps here: takePictureAsync
-  // and PoseLandmarker.detect are both heavy on a phone, and Step 1 only
-  // needs to prove the brain is alive. Step 2 will swap this for true
-  // per-frame processing.
+  // ----- On-device pose snapshot loop (Step 1 + Phase 0 item 3) ------------
+  // Grab a still frame from the camera once a second and ask the on-device
+  // pose model how many joints/people it can see and roughly where the
+  // tracked person's bounding box sits. This now runs as soon as the camera
+  // is ready -- not just while recording -- so the live framing checklist
+  // below (Centered / Fully in frame / Only one person) can guide setup
+  // *before* the user hits Record, not just report on what already
+  // happened. We deliberately don't try to be faster than ~1 fps here:
+  // takePictureAsync and PoseLandmarker.detect are both heavy on a phone,
+  // and this loop only needs to be responsive enough for a human adjusting
+  // their position, not real-time.
   useEffect(() => {
-    if (!recording || !cameraReady || !onDevicePose.ready) return;
+    if (!cameraReady || !onDevicePose.ready) return;
 
     let cancelled = false;
     const tick = async () => {
@@ -7536,10 +7822,11 @@ export default function HomeScreen() {
         });
         if (cancelled || !snapshot?.base64) return;
         const dataUri = `data:image/jpeg;base64,${snapshot.base64}`;
-        const count = await onDevicePose.detect(dataUri);
+        const snapshotResult = await onDevicePose.detect(dataUri);
         if (!cancelled) {
-          console.log('[onDevicePose] tick count:', count);
-          setOnDeviceJointCount(count);
+          console.log('[onDevicePose] tick count:', snapshotResult.count, 'poseCount:', snapshotResult.poseCount);
+          setOnDeviceJointCount(snapshotResult.count);
+          setOnDeviceFraming(snapshotResult);
         }
       } catch (err) {
         // Snapshot can occasionally race with the camera teardown on stop.
@@ -7564,7 +7851,7 @@ export default function HomeScreen() {
     // so its identity is stable except when `ready` changes -- exactly the
     // case this effect needs to react to.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [recording, cameraReady, onDevicePose.ready, onDevicePose.detect]);
+  }, [cameraReady, onDevicePose.ready, onDevicePose.detect]);
 
   // Android hardware back button: if the user is mid-recording or mid-
   // analysis, popping out of the screen would lose work. Confirm with a
@@ -7813,6 +8100,148 @@ export default function HomeScreen() {
       if (token === uploadTokenRef.current) {
         setIsAnalyzing(false);
       }
+    }
+  };
+
+  // ----- Hand Checks upload/record (Phase 1) -------------------------------
+  // Deliberately NOT reusing uploadVideo/startRecording above: those are
+  // wired to `mode`/`dailyTask`/calibration/comparison-session state that
+  // doesn't apply here, and reusing them would mean threading a hand-task
+  // special case through all of that instead of just... not doing that.
+  const uploadHandVideo = async (uri: string) => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), ANALYSIS_TIMEOUT_MS);
+    const token = ++handUploadTokenRef.current;
+
+    try {
+      setHandIsAnalyzing(true);
+      setHandAnalysisError(null);
+      setHandAnalysisResult(null);
+      setHandAnalysisStatusMessage('Checking analysis server...');
+
+      const serverReady = await checkAnalysisServer();
+
+      if (token !== handUploadTokenRef.current) return null;
+
+      if (!serverReady) {
+        setHandAnalysisError(
+          `Cannot analyze yet because the backend is not reachable at ${API_BASE_URL}. Check Server Diagnostics before trying again.`
+        );
+        setHandAnalysisStatusMessage('');
+        setHandPhase('result');
+        return null;
+      }
+
+      setHandAnalysisStatusMessage('Preparing video upload...');
+
+      const formData = new FormData();
+      formData.append('video', {
+        uri,
+        name: 'hand_video.mp4',
+        type: 'video/mp4',
+      } as any);
+      formData.append('hand_task', activeHandTask);
+      formData.append('hand', handSide);
+
+      console.log('Uploading hand video to API:', `${API_BASE_URL}/analyze-hand`, 'task:', activeHandTask, 'hand:', handSide);
+      setHandAnalysisStatusMessage('Uploading video to analysis server...');
+
+      const response = await fetch(`${API_BASE_URL}/analyze-hand`, {
+        method: 'POST',
+        body: formData,
+        signal: controller.signal,
+      });
+
+      setHandAnalysisStatusMessage('Reading analysis results...');
+
+      let data: any = null;
+      try {
+        data = await response.json();
+      } catch {
+        throw new Error(
+          `Backend returned a non-JSON response with status ${response.status}. Restart Flask or check backend logs.`
+        );
+      }
+
+      if (token !== handUploadTokenRef.current) return null;
+
+      if (!response.ok || data.error) {
+        throw new Error(
+          data.details || (data.reasons ? data.reasons.join('; ') : null) || data.error || `Analysis failed with status ${response.status}`
+        );
+      }
+
+      const typedResult = data as HandAnalysisResult;
+      setHandAnalysisResult(typedResult);
+
+      const session: HandCheckSession = {
+        id: `hand_${Date.now()}`,
+        savedAt: new Date().toISOString(),
+        hand_task: activeHandTask,
+        hand: handSide,
+        result: typedResult,
+      };
+      await saveHandCheckSession(session);
+
+      setHandAnalysisStatusMessage('');
+      setHandPhase('result');
+
+      return typedResult;
+    } catch (error: any) {
+      if (token !== handUploadTokenRef.current) return null;
+
+      console.error('Hand upload failed:', error);
+      reportError(error, { route: '/analyze-hand', hand_task: activeHandTask });
+
+      const rawMessage =
+        error?.name === 'AbortError'
+          ? 'Analysis timeout'
+          : error?.message || 'Upload failed';
+
+      setHandAnalysisError(
+        rawMessage === 'Analysis timeout'
+          ? 'The recording took too long to analyze. Try a shorter recording.'
+          : `Could not analyze this recording: ${rawMessage}`
+      );
+      setHandAnalysisStatusMessage('');
+      setHandPhase('result');
+
+      return null;
+    } finally {
+      clearTimeout(timeoutId);
+      if (token === handUploadTokenRef.current) {
+        setHandIsAnalyzing(false);
+      }
+    }
+  };
+
+  const startHandRecording = async () => {
+    if (!handCameraReady || !handCameraRef.current) {
+      console.log('Hand camera not ready yet');
+      return;
+    }
+    try {
+      setHandRecording(true);
+      setHandAnalysisResult(null);
+      setHandAnalysisError(null);
+      setHandAnalysisStatusMessage('');
+
+      const result = await handCameraRef.current.recordAsync({ maxDuration: 20 });
+
+      setHandRecording(false);
+
+      if (result?.uri) {
+        uploadHandVideo(result.uri);
+      }
+    } catch (error) {
+      setHandRecording(false);
+      console.log('Hand recording error:', error);
+    }
+  };
+
+  const stopHandRecording = () => {
+    if (handCameraRef.current) {
+      handCameraRef.current.stopRecording();
     }
   };
 
@@ -12798,6 +13227,230 @@ export default function HomeScreen() {
     );
   }
 
+  if (showHandChecks) {
+    const exitHandChecks = () => {
+      setShowHandChecks(false);
+      setHandPhase('setup');
+      setHandRecording(false);
+      setHandCameraReady(false);
+      setHandAnalysisResult(null);
+      setHandAnalysisError(null);
+      setHandAnalysisStatusMessage('');
+    };
+
+    const metricRows = getHandMetricRows(handAnalysisResult?.task_analysis);
+    const insufficientHandData = handAnalysisResult?.task_analysis?.status === 'insufficient_hand_data';
+    const handSideLabel = handSide === 'right' ? 'Right Hand' : 'Left Hand';
+
+    if (handPhase === 'setup') {
+      return (
+        <ScrollView
+          style={styles.homeScroll}
+          contentContainerStyle={styles.cameraSetupContent}
+          showsVerticalScrollIndicator={false}
+        >
+          <ScreenHeader onBack={exitHandChecks} />
+          <View style={styles.heroBadge}>
+            <Text style={styles.heroBadgeText}>Hand Checks</Text>
+          </View>
+          <Text style={styles.title}>{getHandTaskLabel(activeHandTask)}</Text>
+          <Text style={styles.subtitle}>
+            {getHandTaskOneLiner(activeHandTask)} Descriptive only, not a diagnosis.
+          </Text>
+
+          <Text style={[styles.testResultLabel, { marginBottom: 10, alignSelf: 'flex-start' }]}>
+            Which hand?
+          </Text>
+          <View style={{ flexDirection: 'row', gap: 10, marginBottom: 16, width: '100%' }}>
+            <Pressable
+              style={[styles.dailyTaskChip, { flex: 1 }, handSide === 'right' ? styles.dailyTaskChipActive : null]}
+              onPress={() => setHandSide('right')}
+              accessibilityRole="radio"
+              accessibilityState={{ selected: handSide === 'right' }}
+            >
+              <Text style={styles.dailyTaskChipText}>Right Hand</Text>
+            </Pressable>
+            <Pressable
+              style={[styles.dailyTaskChip, { flex: 1 }, handSide === 'left' ? styles.dailyTaskChipActive : null]}
+              onPress={() => setHandSide('left')}
+              accessibilityRole="radio"
+              accessibilityState={{ selected: handSide === 'left' }}
+            >
+              <Text style={styles.dailyTaskChipText}>Left Hand</Text>
+            </Pressable>
+          </View>
+
+          <Text style={[styles.testResultLabel, { marginBottom: 10, alignSelf: 'flex-start' }]}>
+            Before recording, check these
+          </Text>
+          <View style={styles.recordingChecklistBox}>
+            {getHandTaskInstructions(activeHandTask).map((item, index) => (
+              <Text key={index} style={styles.recordingChecklistText}>
+                {'\u2713'} {item}
+              </Text>
+            ))}
+          </View>
+
+          <Pressable
+            style={[styles.mainButton, { marginTop: 20 }]}
+            onPress={() => setHandPhase('camera')}
+            accessibilityRole="button"
+            accessibilityLabel={`Continue to camera for ${getHandTaskLabel(activeHandTask)}`}
+          >
+            <Text style={styles.buttonText}>Continue to Camera</Text>
+          </Pressable>
+        </ScrollView>
+      );
+    }
+
+    if (handPhase === 'camera') {
+      return (
+        <View style={styles.fullScreen}>
+          <CameraView
+            ref={handCameraRef}
+            style={styles.camera}
+            facing="back"
+            mode="video"
+            mute
+            onCameraReady={() => setHandCameraReady(true)}
+          />
+
+          <View style={styles.topStatus}>
+            <Text style={styles.statusText}>
+              {handCameraReady ? 'Camera ready' : 'Loading camera...'}
+            </Text>
+          </View>
+
+          <View style={styles.captureHintCard}>
+            <Text style={styles.captureHintEyebrow}>Hand Checks</Text>
+            <Text style={styles.captureHintTitle}>
+              Record {getHandTaskLabel(activeHandTask)} ({handSideLabel})
+            </Text>
+            <Text style={styles.captureHintText}>Before recording, check these:</Text>
+            <View style={styles.recordingChecklistBox}>
+              {getHandTaskInstructions(activeHandTask).map((item, index) => (
+                <Text key={index} style={styles.recordingChecklistText}>
+                  {'\u2713'} {item}
+                </Text>
+              ))}
+            </View>
+            {handIsAnalyzing ? (
+              <Text style={styles.recordingChecklistText}>
+                {handAnalysisStatusMessage || 'Analyzing...'}
+              </Text>
+            ) : null}
+          </View>
+
+          <View style={styles.bottomControls}>
+            {handRecording ? (
+              <Pressable style={styles.stopButton} onPress={stopHandRecording}>
+                <Text style={styles.buttonText}>Stop</Text>
+              </Pressable>
+            ) : handIsAnalyzing ? (
+              <Pressable style={[styles.recordButton, styles.disabledButton]} disabled>
+                <Text style={styles.buttonText}>Analyzing...</Text>
+              </Pressable>
+            ) : (
+              <Pressable
+                style={[styles.recordButton, !handCameraReady && styles.disabledButton]}
+                onPress={startHandRecording}
+                disabled={!handCameraReady}
+              >
+                <Text style={styles.buttonText}>Record</Text>
+              </Pressable>
+            )}
+
+            <Pressable
+              style={styles.secondaryButton}
+              onPress={() => {
+                setHandPhase('setup');
+                setHandCameraReady(false);
+              }}
+            >
+              <Text style={styles.buttonText}>Back</Text>
+            </Pressable>
+          </View>
+        </View>
+      );
+    }
+
+    return (
+      <ScrollView
+        style={styles.homeScroll}
+        contentContainerStyle={styles.cameraSetupContent}
+        showsVerticalScrollIndicator={false}
+      >
+        <ScreenHeader onBack={exitHandChecks} />
+        <View style={styles.heroBadge}>
+          <Text style={styles.heroBadgeText}>Hand Checks</Text>
+        </View>
+        <Text style={styles.title}>{getHandTaskLabel(activeHandTask)} Result</Text>
+        <Text style={[styles.subtitle, { marginBottom: 16 }]}>{handSideLabel}</Text>
+
+        {handAnalysisError ? (
+          <View style={styles.testResultCard}>
+            <Text style={styles.testResultLabel}>Could not analyze this recording</Text>
+            <Text style={[styles.homeTileText, { marginTop: 6 }]}>{handAnalysisError}</Text>
+          </View>
+        ) : insufficientHandData ? (
+          <View style={styles.testResultCard}>
+            <Text style={styles.testResultLabel}>Not enough hand tracking</Text>
+            <Text style={[styles.homeTileText, { marginTop: 6 }]}>
+              This recording didn&apos;t have enough visible hand movement to measure. Try again with your{' '}
+              {handSide} hand clearly visible for the whole recording.
+            </Text>
+          </View>
+        ) : (
+          <>
+            <View style={styles.testResultCard}>
+              {metricRows.map((row, index) => (
+                <View
+                  key={row.key}
+                  style={index === metricRows.length - 1 ? [styles.testResultRow, { borderBottomWidth: 0 }] : styles.testResultRow}
+                >
+                  <View style={{ flex: 1, marginRight: 10 }}>
+                    <Text style={styles.testResultLabel}>{row.label}</Text>
+                    <Text style={[styles.recordingChecklistText, { marginTop: 2 }]}>{row.description}</Text>
+                  </View>
+                  <Text style={styles.testResultValue}>
+                    {row.value}
+                    {row.unit ? ` ${row.unit}` : ''}
+                  </Text>
+                </View>
+              ))}
+            </View>
+
+            {handAnalysisResult?.recording_quality_warnings && handAnalysisResult.recording_quality_warnings.length > 0 ? (
+              <View style={[styles.recordingChecklistBox, { marginTop: 10 }]}>
+                {handAnalysisResult.recording_quality_warnings.map((w, index) => (
+                  <Text key={index} style={styles.recordingChecklistText}>
+                    {'\u26a0'} {w}
+                  </Text>
+                ))}
+              </View>
+            ) : null}
+          </>
+        )}
+
+        <Pressable
+          style={[styles.mainButton, { marginTop: 16 }]}
+          onPress={() => {
+            setHandPhase('setup');
+            setHandCameraReady(false);
+            setHandAnalysisResult(null);
+            setHandAnalysisError(null);
+          }}
+        >
+          <Text style={styles.buttonText}>Record Again</Text>
+        </Pressable>
+
+        <Pressable style={[styles.secondaryButton, { marginTop: 10 }]} onPress={exitHandChecks}>
+          <Text style={styles.buttonText}>Done</Text>
+        </Pressable>
+      </ScrollView>
+    );
+  }
+
   if (showServerDiagnostics) {
     const serverBadge = getServerHealthBadgeLabel(serverHealth.status);
 
@@ -14587,6 +15240,33 @@ export default function HomeScreen() {
               <Text style={styles.homeTileTitle}>Dual-Task Walk</Text>
               <Text style={styles.homeTileText}>Walk once plain, once while counting -- see the gap.</Text>
             </Pressable>
+          </View>
+
+          <Text style={[styles.sectionTitle, { marginTop: 28 }]}>Hand Checks</Text>
+          <Text style={[styles.homeTileText, { marginBottom: 12 }]}>
+            Camera-based finger and hand movement checks -- pick a hand, then record.
+          </Text>
+          <View style={styles.homeTileGrid}>
+            {HAND_TASKS.map((task) => (
+              <Pressable
+                key={task}
+                style={styles.homeTile}
+                onPress={() => {
+                  closeAllOverlays();
+                  setActiveHandTask(task);
+                  setHandPhase('setup');
+                  setHandAnalysisResult(null);
+                  setHandAnalysisError(null);
+                  setShowHandChecks(true);
+                }}
+                accessibilityRole="button"
+                accessibilityLabel={getHandTaskLabel(task)}
+                accessibilityHint={getHandTaskOneLiner(task)}
+              >
+                <Text style={styles.homeTileTitle}>{getHandTaskLabel(task)}</Text>
+                <Text style={styles.homeTileText}>{getHandTaskOneLiner(task)}</Text>
+              </Pressable>
+            ))}
           </View>
 
           <Text style={[styles.sectionTitle, { marginTop: 20 }]}>Explore</Text>
@@ -16970,6 +17650,31 @@ export default function HomeScreen() {
                 On-device pose: warming up…
               </Text>
             )}
+
+            {/* Live framing checklist (Phase 0 item 3): derived from the
+                same on-device snapshot above, this gives a traffic-light
+                read on whether the subject is centered, fully in frame,
+                and alone -- so the user can fix their setup *before*
+                hitting Record instead of finding out after the fact from
+                a RecordingQualityError. */}
+            {onDevicePose.ready && !onDevicePose.error ? (
+              <View style={styles.recordingChecklistBox}>
+                <Text style={styles.captureHintText}>Live framing check:</Text>
+                {getFramingChecklistItems(onDeviceFraming).map((item, index) => {
+                  const color =
+                    item.ok === null ? '#94a3b8' : item.ok ? '#22c55e' : '#eab308';
+                  const mark = item.ok === null ? '•' : item.ok ? '✓' : '!';
+                  return (
+                    <Text
+                      key={index}
+                      style={[styles.recordingChecklistText, { color }]}
+                    >
+                      {mark} {item.label}
+                    </Text>
+                  );
+                })}
+              </View>
+            ) : null}
           </View>
 
           {mode === 'daily' || mode === 'rehab' ? (
@@ -17016,6 +17721,7 @@ export default function HomeScreen() {
                 setAnalysisStatusMessage('');
                 setComparisonSession(null);
                 setOnDeviceJointCount(null);
+                setOnDeviceFraming(null);
               }}
             >
               <Text style={styles.buttonText}>Back</Text>

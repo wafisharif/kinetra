@@ -7,6 +7,14 @@ import numpy as np
 import csv
 from typing import Any, Dict
 
+# pose_tracking.py wraps mediapipe's modern Tasks API (PoseLandmarker) and
+# does the multi-person "patient lock" tracking -- see that module's own
+# docstring. mp_pose above is kept purely for its PoseLandmark index
+# constants (identical topology in both APIs) and POSE_CONNECTIONS for the
+# interactive-mode drawing path below; it's no longer used to run detection.
+from pose_tracking import PoseTracker
+from recording_quality import RecordingQualityError, check_recording_quality
+
 # -----------------------------
 # NOTE ON THIS REFACTOR (server-safe import)
 # -----------------------------
@@ -24,6 +32,12 @@ from typing import Any, Dict
 # matplotlib is imported lazily inside run_analysis(), only on the
 # interactive (non-backend) path, so importing/using this module from a
 # server never pays for that import.
+
+# Bumped whenever the detection/scoring pipeline changes in a way that could
+# shift results for the same input video -- e.g. the Tasks API migration
+# below. Returned in every result so validation data (and anyone comparing
+# scores over time) can tell which pipeline version produced a given number.
+ALGORITHM_VERSION = "pose-v2-tasks-landmarker-2026.11"
 
 # -----------------------------
 # ANGLE CALCULATION
@@ -2212,7 +2226,7 @@ DEFAULT_FLEX_THRESHOLD = 95
 DEFAULT_EXTEND_THRESHOLD = 115
 
 
-def run_analysis(video_path, mode="rep", daily_task="reach", output_csv="elbow_angles.csv", backend_mode=True, side="right", flex_threshold=None, extend_threshold=None):
+def run_analysis(video_path, mode="rep", daily_task="reach", output_csv="elbow_angles.csv", backend_mode=True, side="right", flex_threshold=None, extend_threshold=None, trial_index=None):
     """
     Run the full pose-based movement analysis on one video and return the
     result dict -- the same shape server.py previously got back (as JSON on
@@ -2292,7 +2306,7 @@ def run_analysis(video_path, mode="rep", daily_task="reach", output_csv="elbow_a
         ARM_ELBOW_LM = mp_pose.PoseLandmark.RIGHT_ELBOW
         ARM_WRIST_LM = mp_pose.PoseLandmark.RIGHT_WRIST
 
-    pose = mp_pose.Pose()
+    tracker = PoseTracker()
     cap = None
     try:
         # -----------------------------
@@ -2322,6 +2336,11 @@ def run_analysis(video_path, mode="rep", daily_task="reach", output_csv="elbow_a
 
         frame_index = 0
         angle_data = []
+        visible_frame_count = 0
+        # VIDEO-mode Tasks API requires strictly increasing timestamps per
+        # detect_for_video() call; tracked here rather than trusting
+        # frame_index/fps alone in case of a fractional/duplicate timestamp.
+        tracker_last_timestamp_ms = -1
 
         # -----------------------------
         # TASK-SPECIFIC SIGNAL STORAGE
@@ -2381,21 +2400,35 @@ def run_analysis(video_path, mode="rep", daily_task="reach", output_csv="elbow_a
                 break
 
             image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = pose.process(image_rgb)
+
+            timestamp_ms = int((frame_index / fps) * 1000) if fps else frame_index * 33
+            if timestamp_ms <= tracker_last_timestamp_ms:
+                timestamp_ms = tracker_last_timestamp_ms + 1
+            tracker_last_timestamp_ms = timestamp_ms
+            pose_frame_result = tracker.process(image_rgb, timestamp_ms)
 
             angle = None
 
-            pose_landmarks = getattr(results, "pose_landmarks", None)
+            landmarks = pose_frame_result.target_landmarks
 
-            if pose_landmarks is not None:
+            if landmarks is not None:
+                visible_frame_count += 1
+
                 if not backend_mode:
+                    # Tasks-API landmarks are a plain list (no `.landmark`
+                    # wrapper like the legacy solutions API), so
+                    # draw_landmarks -- which expects that wrapper -- needs
+                    # a tiny adapter. Debug/interactive-only path; never
+                    # exercised by the server or the test suite.
+                    class _LegacyLandmarkListAdapter:
+                        def __init__(self, items):
+                            self.landmark = items
+
                     mp_drawing.draw_landmarks(
                         frame,
-                        pose_landmarks,
+                        _LegacyLandmarkListAdapter(landmarks),
                         getattr(mp_pose, "POSE_CONNECTIONS")
                     )
-
-                landmarks = pose_landmarks.landmark
 
                 # Fixed right-side torso reference -- used only by the
                 # whole-body/bilateral tasks (sit-to-stand, balance,
@@ -2651,6 +2684,23 @@ def run_analysis(video_path, mode="rep", daily_task="reach", output_csv="elbow_a
         if not backend_mode:
             cv2.destroyAllWindows()
 
+        # -----------------------------
+        # RECORDING QUALITY CHECK
+        # -----------------------------
+        # Runs as soon as the (unavoidable) per-frame detection pass above
+        # finishes, before any of the heavier per-task summarization work
+        # below -- so a bad recording fails with a clear, actionable reason
+        # instead of quietly producing a low-confidence (or just wrong)
+        # score. See recording_quality.py.
+        quality_result = check_recording_quality(
+            total_frames=len(angle_data),
+            visible_frame_count=visible_frame_count,
+            fps=fps,
+            low_confidence_tracking_count=tracker.low_confidence_frame_count,
+        )
+        if not quality_result.passed:
+            raise RecordingQualityError(quality_result.reasons)
+
 
         # -----------------------------
         # DATA PROCESSING
@@ -2863,6 +2913,8 @@ def run_analysis(video_path, mode="rep", daily_task="reach", output_csv="elbow_a
             "mode": mode,
             "side": normalized_side,
             "fps": fps,
+            "algorithm_version": ALGORITHM_VERSION,
+            "trial_index": trial_index,
             "calibration_data": calibration_data,
             "daily_task": daily_task,
             "daily_task_label": get_daily_task_label(daily_task),
@@ -2871,6 +2923,11 @@ def run_analysis(video_path, mode="rep", daily_task="reach", output_csv="elbow_a
             "output_csv": output_csv,
             "total_frames": len(angle_data),
             "signal_quality": signal_quality,
+            "recording_quality_warnings": quality_result.warnings,
+            "tracking_confidence_summary": {
+                "low_confidence_frames": tracker.low_confidence_frame_count,
+                "total_frames_tracked": tracker.total_frame_count,
+            },
             "reps": safe_float(reps),
             "transitions": transitions,
             "max_extension_speed": safe_float(max_velocity),
@@ -3053,7 +3110,7 @@ def run_analysis(video_path, mode="rep", daily_task="reach", output_csv="elbow_a
     finally:
         if cap is not None:
             cap.release()
-        pose.close()
+        tracker.close()
 
 
 if __name__ == "__main__":

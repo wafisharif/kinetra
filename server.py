@@ -10,6 +10,8 @@ from pathlib import Path
 import requests
 
 from pose_test import run_analysis
+from recording_quality import RecordingQualityError
+from hand_tasks import run_hand_analysis, HAND_TASKS
 from accounts import accounts_bp, init_db
 from sync import sync_bp, init_sync_db
 
@@ -125,6 +127,72 @@ def _client_key() -> str:
     return request.remote_addr or "unknown"
 
 
+# ---------------------------------------------------------------------------
+# Shared request lifecycle for /analyze and /analyze-hand (Phase 1). Both
+# routes save an uploaded video, run one analysis function against it under
+# the same hard timeout, translate the same set of possible exceptions into
+# the same HTTP responses, and always clean up the uploaded file(s)
+# afterward -- this used to be duplicated inline in /analyze alone; now
+# both routes call this with their own save/log step and analysis function.
+# ---------------------------------------------------------------------------
+def _execute_analysis_and_respond(save_and_log_fn, run_fn, run_kwargs, cleanup_paths):
+    try:
+        save_and_log_fn()
+
+        result_data = _run_with_timeout(run_fn, ANALYSIS_TIMEOUT_SECONDS, **run_kwargs)
+
+        # Generic success log -- total_frames exists on both result
+        # shapes (pose and hand); movement_health_score only exists on
+        # pose results, so .get() just prints None for a hand result
+        # rather than needing a per-route success callback here.
+        print("=== ANALYSIS OK ===")
+        print(f"total_frames={result_data.get('total_frames')} "
+              f"movement_health_score={result_data.get('movement_health_score')}")
+
+        return jsonify(result_data), 200
+
+    except TimeoutError:
+        return jsonify({
+            "error": "Analysis timeout",
+            "details": f"Analysis took longer than {ANALYSIS_TIMEOUT_SECONDS} seconds. Try a shorter video."
+        }), 504
+
+    except RecordingQualityError as e:
+        # Raised (via recording_quality.py, shared by both pipelines) when
+        # the recording itself -- not the server, not the request -- failed
+        # a hard quality bar (person/hand not visible enough, too short,
+        # etc). 422 (not 500, not a silently-returned bad score) so the app
+        # can show the person exactly why and let them re-record.
+        return jsonify({
+            "error": "Recording quality check failed",
+            "reasons": e.reasons,
+        }), 422
+
+    except RuntimeError as e:
+        # Raised by the analysis function itself, e.g. an unreadable/
+        # corrupt video, or (hand_tasks.run_hand_analysis) an unrecognized
+        # hand_task that slipped past the route's own HAND_TASKS check.
+        return jsonify({
+            "error": "Analysis failed",
+            "details": str(e)
+        }), 500
+
+    except Exception as e:
+        print(f"Unexpected error during analysis: {e}")
+        return jsonify({
+            "error": "Server error",
+            "details": str(e)
+        }), 500
+
+    finally:
+        for path in cleanup_paths:
+            try:
+                if path is not None and path.exists():
+                    path.unlink()
+            except Exception as cleanup_error:
+                print(f"Cleanup failed for {path}: {cleanup_error}")
+
+
 @app.route("/", methods=["GET"])
 def root():
     return jsonify({
@@ -177,6 +245,18 @@ def analyze():
     side = request.form.get("side", "right")
     flex_threshold = request.form.get("flex_threshold")
     extend_threshold = request.form.get("extend_threshold")
+    # Phase 0 addition: which repeat (1-based) this is within a session of
+    # back-to-back trials of the same task, for test-retest reliability
+    # comparisons later. Purely a passthrough -- the app decides what it
+    # means and how many trials to do; this just gets echoed back onto the
+    # result so a trial's own result carries its index. Invalid/missing
+    # values fall back to None rather than erroring the whole request over
+    # what is just metadata.
+    raw_trial_index = request.form.get("trial_index")
+    try:
+        trial_index = int(raw_trial_index) if raw_trial_index is not None else None
+    except (TypeError, ValueError):
+        trial_index = None
 
     if file.filename == "":
         return jsonify({
@@ -196,9 +276,8 @@ def analyze():
     # `finally` block below, same as the uploaded video.
     csv_path = UPLOAD_DIR / f"angles_{upload_id}.csv"
 
-    try:
+    def _save_and_log():
         file.save(filepath)
-
         print("\n=== ANALYSIS REQUEST ===")
         print(f"mode={mode}")
         print(f"daily_task={daily_task}")
@@ -206,9 +285,10 @@ def analyze():
         print(f"flex_threshold={flex_threshold} extend_threshold={extend_threshold}")
         print(f"video={filepath}")
 
-        result_data = _run_with_timeout(
-            run_analysis,
-            ANALYSIS_TIMEOUT_SECONDS,
+    return _execute_analysis_and_respond(
+        _save_and_log,
+        run_analysis,
+        dict(
             video_path=str(filepath),
             mode=mode,
             daily_task=daily_task,
@@ -217,45 +297,81 @@ def analyze():
             side=side,
             flex_threshold=flex_threshold,
             extend_threshold=extend_threshold,
-        )
+            trial_index=trial_index,
+        ),
+        cleanup_paths=[filepath, csv_path],
+    )
 
-        print("=== ANALYSIS OK ===")
-        print(f"total_frames={result_data.get('total_frames')} "
-              f"movement_health_score={result_data.get('movement_health_score')}")
 
-        return jsonify(result_data), 200
-
-    except TimeoutError:
+# ---------------------------------------------------------------------------
+# Phase 1: hand-task analysis (Finger Tapping (Camera), Hand Open/Close,
+# Pronation-Supination, Postural Tremor, Rest Tremor). Separate route from
+# /analyze -- a different landmarker (hand_tasks.HandTracker, not
+# pose_tracking.PoseTracker), a different request shape (hand_task + hand,
+# not mode/daily_task/side) -- but the same upload/timeout/error/cleanup
+# lifecycle via _execute_analysis_and_respond above. Only one of the two
+# landmarkers is ever resident at a time: each route creates its own
+# tracker per request and the shared helper's cleanup/return always lets it
+# fall out of scope (and get garbage-collected) before the next request --
+# deliberate, given Render's free-tier 512MB instance (see this file's
+# upload-size comment above for that same constraint).
+# ---------------------------------------------------------------------------
+@app.route("/analyze-hand", methods=["POST"])
+def analyze_hand():
+    if _is_rate_limited(_client_key()):
         return jsonify({
-            "error": "Analysis timeout",
-            "details": f"Analysis took longer than {ANALYSIS_TIMEOUT_SECONDS} seconds. Try a shorter video."
-        }), 504
+            "error": "Too many requests",
+            "details": f"Limit is {RATE_LIMIT_MAX_REQUESTS} analyses per {RATE_LIMIT_WINDOW_SECONDS} seconds. Try again shortly."
+        }), 429
 
-    except RuntimeError as e:
-        # Raised by run_analysis() itself, e.g. an unreadable/corrupt video.
+    if "video" not in request.files:
+        return jsonify({"error": "No video uploaded"}), 400
+
+    file = request.files["video"]
+    hand_task = request.form.get("hand_task", "finger_tapping_camera")
+    hand = request.form.get("hand", "right")
+    # Same passthrough convention as /analyze's trial_index -- see that
+    # route's own comment on why an invalid/missing value just falls back
+    # to None rather than erroring the whole request.
+    raw_trial_index = request.form.get("trial_index")
+    try:
+        trial_index = int(raw_trial_index) if raw_trial_index is not None else None
+    except (TypeError, ValueError):
+        trial_index = None
+
+    if file.filename == "":
         return jsonify({
-            "error": "Analysis failed",
-            "details": str(e)
-        }), 500
+            "error": "Empty upload",
+            "details": "No video filename was provided."
+        }), 400
 
-    except Exception as e:
-        print(f"Unexpected error during analysis: {e}")
+    if hand_task not in HAND_TASKS:
         return jsonify({
-            "error": "Server error",
-            "details": str(e)
-        }), 500
+            "error": "Unknown hand_task",
+            "details": f"hand_task must be one of {HAND_TASKS}."
+        }), 400
 
-    finally:
-        try:
-            if filepath.exists():
-                filepath.unlink()
-        except Exception as cleanup_error:
-            print(f"Cleanup failed for {filepath}: {cleanup_error}")
-        try:
-            if csv_path.exists():
-                csv_path.unlink()
-        except Exception as cleanup_error:
-            print(f"Cleanup failed for {csv_path}: {cleanup_error}")
+    upload_id = uuid.uuid4().hex
+    filepath = UPLOAD_DIR / f"uploaded_hand_{upload_id}.mp4"
+
+    def _save_and_log():
+        file.save(filepath)
+        print("\n=== HAND ANALYSIS REQUEST ===")
+        print(f"hand_task={hand_task}")
+        print(f"hand={hand}")
+        print(f"video={filepath}")
+
+    return _execute_analysis_and_respond(
+        _save_and_log,
+        run_hand_analysis,
+        dict(
+            video_path=str(filepath),
+            hand_task=hand_task,
+            hand=hand,
+            trial_index=trial_index,
+        ),
+        cleanup_paths=[filepath],
+    )
 
 
 # ---------------------------------------------------------------------------

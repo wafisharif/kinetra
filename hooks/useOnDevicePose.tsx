@@ -20,7 +20,14 @@ import type { ComponentType } from 'react';
 // The hook returns:
 //   - ready:    true once the worker has loaded MediaPipe and is ready
 //   - error:    last error message from the worker, if any
-//   - detect:   send a base64 JPEG, get back a landmark count (0–33)
+//   - detect:   send a base64 JPEG, get back a PoseDetectionSnapshot --
+//               a landmark count (0–33), how many distinct people the
+//               model found (poseCount, Phase 0's "only one person"
+//               check), and a normalized 0-1 bounding box of the
+//               primary detected person (Phase 0's "centered"/"fully
+//               in frame" checks) -- see app/(tabs)/index.tsx's live
+//               pre-recording framing checklist for how these feed a
+//               traffic light the person can see before they record.
 //   - Worker:   a React component to render once, somewhere in the tree
 // ---------------------------------------------------------------------------
 
@@ -85,7 +92,10 @@ const WORKER_HTML = `<!doctype html>
           if (!msg || msg.type !== 'detect') return;
           var requestId = msg.requestId;
           var dataUri = msg.dataUri;
-          if (!dataUri) { post('result', { requestId: requestId, count: 0 }); return; }
+          if (!dataUri) {
+            post('result', { requestId: requestId, count: 0, poseCount: 0, bbox: null });
+            return;
+          }
           try {
             var img = await loadImage(dataUri);
             if (canvas.width !== img.naturalWidth || canvas.height !== img.naturalHeight) {
@@ -94,11 +104,34 @@ const WORKER_HTML = `<!doctype html>
             }
             ctx.drawImage(img, 0, 0);
             var result = landmarker.detect(canvas);
-            var landmarks = result && result.landmarks && result.landmarks[0];
-            post('result', { requestId: requestId, count: landmarks ? landmarks.length : 0 });
+            var allPoses = (result && result.landmarks) || [];
+            var landmarks = allPoses[0];
+            // Normalized (0-1) bounding box of the primary detected
+            // person -- cheap to compute here, once, rather than
+            // shipping all 33 landmark points across the bridge on
+            // every tick just so the React side can do this same
+            // min/max itself.
+            var bbox = null;
+            if (landmarks && landmarks.length) {
+              var minX = 1, minY = 1, maxX = 0, maxY = 0;
+              for (var i = 0; i < landmarks.length; i++) {
+                var lx = landmarks[i].x, ly = landmarks[i].y;
+                if (lx < minX) minX = lx;
+                if (ly < minY) minY = ly;
+                if (lx > maxX) maxX = lx;
+                if (ly > maxY) maxY = ly;
+              }
+              bbox = { minX: minX, minY: minY, maxX: maxX, maxY: maxY };
+            }
+            post('result', {
+              requestId: requestId,
+              count: landmarks ? landmarks.length : 0,
+              poseCount: allPoses.length,
+              bbox: bbox
+            });
           } catch (e) {
             post('error', { message: 'detect failed: ' + (e && e.message ? e.message : String(e)) });
-            post('result', { requestId: requestId, count: 0 });
+            post('result', { requestId: requestId, count: 0, poseCount: 0, bbox: null });
           }
         }
 
@@ -118,7 +151,12 @@ const WORKER_HTML = `<!doctype html>
               delegate: 'GPU'
             },
             runningMode: 'IMAGE',
-            numPoses: 1
+            // 2, not 1: just enough to tell "someone else is also in
+            // frame" (Phase 0's live "only one person" check) without
+            // paying for full multi-person tracking, which this live
+            // preview doesn't need -- that's pose_tracking.py's job,
+            // server-side, on the actual recorded video.
+            numPoses: 2
           });
 
           setStatus('ready');
@@ -145,17 +183,39 @@ const WORKER_HTML = `<!doctype html>
 // self-contained: no asset pipeline, no fetch, no race with the dev server.
 const WORKER_SOURCE = { html: WORKER_HTML, baseUrl: 'https://localhost' };
 
+// Normalized (0-1) bounding box of one detected person, in the same
+// coordinate space MediaPipe's landmarks already use.
+export type PoseBoundingBox = {
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+};
+
+// What one detect() call resolves to. `count` is the existing Step-1
+// "is the brain alive" joint count; `poseCount` and `bbox` are Phase
+// 0's addition, feeding the live pre-recording framing checklist in
+// app/(tabs)/index.tsx ("centered", "fully in frame", "only one
+// person").
+export type PoseDetectionSnapshot = {
+  count: number;
+  poseCount: number;
+  bbox: PoseBoundingBox | null;
+};
+
+const EMPTY_SNAPSHOT: PoseDetectionSnapshot = { count: 0, poseCount: 0, bbox: null };
+
 type WorkerMessage =
   | { type: 'ready' }
   | { type: 'error'; message: string }
-  | { type: 'result'; requestId: number; count: number };
+  | { type: 'result'; requestId: number; count: number; poseCount: number; bbox: PoseBoundingBox | null };
 
 type WorkerPostMessage = (message: string) => void;
 
 type UseOnDevicePoseResult = {
   ready: boolean;
   error: string | null;
-  detect: (base64Jpeg: string) => Promise<number>;
+  detect: (base64Jpeg: string) => Promise<PoseDetectionSnapshot>;
   Worker: ComponentType;
 };
 
@@ -173,7 +233,7 @@ export function useOnDevicePose(): UseOnDevicePoseResult {
   // fires into a not-yet-ready WebView. On iOS this is essentially instant.
   const webViewLoadedRef = useRef(false);
 
-  const pendingRef = useRef<Map<number, (count: number) => void>>(new Map());
+  const pendingRef = useRef<Map<number, (snapshot: PoseDetectionSnapshot) => void>>(new Map());
   const nextRequestIdRef = useRef(1);
 
   const onMessage = useCallback((event: WebViewMessageEvent) => {
@@ -200,33 +260,33 @@ export function useOnDevicePose(): UseOnDevicePoseResult {
       const resolve = pendingRef.current.get(msg.requestId);
       if (resolve) {
         pendingRef.current.delete(msg.requestId);
-        resolve(msg.count);
+        resolve({ count: msg.count, poseCount: msg.poseCount, bbox: msg.bbox });
       }
     }
   }, []);
 
   const detect = useCallback(
-    (base64Jpeg: string): Promise<number> => {
+    (base64Jpeg: string): Promise<PoseDetectionSnapshot> => {
       const handle = webViewRef.current;
       if (!handle || !ready || !webViewLoadedRef.current) {
-        return Promise.resolve(0);
+        return Promise.resolve(EMPTY_SNAPSHOT);
       }
 
       const requestId = nextRequestIdRef.current++;
-      return new Promise<number>((resolve) => {
+      return new Promise<PoseDetectionSnapshot>((resolve) => {
         const timeoutId = setTimeout(() => {
           // If the WebView never replies within 5 s, treat it as a missed
           // detection. This prevents the UI from getting stuck at 0/33 when
           // the round-trip silently fails (a real failure mode on Android
           // when the WebView loses focus during recording).
           if (pendingRef.current.delete(requestId)) {
-            resolve(0);
+            resolve(EMPTY_SNAPSHOT);
           }
         }, 5000);
 
-        pendingRef.current.set(requestId, (count) => {
+        pendingRef.current.set(requestId, (snapshot) => {
           clearTimeout(timeoutId);
-          resolve(count);
+          resolve(snapshot);
         });
 
         try {
@@ -242,7 +302,7 @@ export function useOnDevicePose(): UseOnDevicePoseResult {
           // immediately so the snapshot loop can keep ticking.
           if (pendingRef.current.delete(requestId)) {
             clearTimeout(timeoutId);
-            resolve(0);
+            resolve(EMPTY_SNAPSHOT);
           }
         }
       });
@@ -252,7 +312,7 @@ export function useOnDevicePose(): UseOnDevicePoseResult {
 
   useEffect(() => {
     return () => {
-      pendingRef.current.forEach((resolve) => resolve(0));
+      pendingRef.current.forEach((resolve) => resolve(EMPTY_SNAPSHOT));
       pendingRef.current.clear();
     };
   }, []);
